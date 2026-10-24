@@ -59,6 +59,7 @@ PostgreSQL e LocalStack reais:
 | A2      | `bun test` sobe o `ApiModule` real (`Test.createTestingModule`) e serve HTTP; `/health/ready` checa Postgres + SQS |
 | A3      | O entrypoint da API sai com código 0 no `SIGTERM`, depois dos shutdown hooks do Nest                               |
 | A3b     | Os entrypoints dos 3 workers respondem `/health/live` e `/health/ready` e saem com 0 no `SIGTERM`                  |
+| A3c     | Os 4 entrypoints saem com 0 num `SIGTERM` recebido durante o boot (seção 6, desligamento)                          |
 | B4      | `MikroOrmModule` + `RequestContext`: cada requisição recebe um `EntityManager` próprio                             |
 | B5      | `numeric(20,2)` faz ida e volta como **string** exata (`"12345678901234567.89"`, `"0.10"`)                         |
 | B6      | `PESSIMISTIC_WRITE` gera `SELECT ... FOR UPDATE`                                                                   |
@@ -229,6 +230,26 @@ localstack (healthy = init concluído) ───────┼──► api ×3
   servidor HTTP interno (`WORKER_HEALTH_PORT`, 9100) com `/health/live` e `/health/ready`. No SIGTERM
   saem com 0 depois de fechar o pool e o cliente SQS. A readiness da API e a dos workers usam a mesma
   função (`checkReadiness`).
+- **Desligamento (SIGTERM):** o Docker manda SIGTERM e, se o processo não sair dentro do
+  `stop_grace_period` (15 s), manda SIGKILL. O handler de SIGTERM é instalado **antes do boot**: os
+  entrypoints importam estaticamente só a config e `graceful-shutdown.ts`, e carregam Nest, ORM e SDK
+  com `await import()` depois. Antes, o handler só existia no fim do boot. O processo é PID 1 no
+  container, e o kernel ignora sinais que o PID 1 não trata, então um SIGTERM durante o boot se
+  perdia: o container ficava pendurado até o SIGKILL (reproduzido: 18 s e exit 137). Agora um SIGTERM
+  antes de o app estar montado sai com 0 na hora (ainda não há trabalho em andamento); depois, o
+  fechamento normal roda (para de aceitar trabalho, fecha pool e cliente SQS) e sai com 0. Como rede de
+  segurança, o compose usa `init: true`: o tini vira PID 1 e repassa sinais, cobrindo os poucos
+  milissegundos de startup do runtime antes do handler existir.
+
+  | Exit           | Significado                                                                                                                                                                               | Avaliação                                                                                                                                                                                                                                                |
+  | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+  | 0              | o handler recebeu o SIGTERM, fechou os recursos e saiu                                                                                                                                    | esperado                                                                                                                                                                                                                                                 |
+  | 143 (128 + 15) | morreu pelo próprio SIGTERM, antes de o handler existir; com o tini isso só acontece nos primeiros milissegundos de startup, quando ainda não há conexão aberta nem trabalho em andamento | aceitável: parada imediata e sem perda                                                                                                                                                                                                                   |
+  | 137 (128 + 9)  | ignorou ou não terminou a tempo e levou SIGKILL no fim do grace period                                                                                                                    | **falha**: o desligamento travou, o deploy/scale-down esperou o grace period inteiro, e no futuro uma mensagem ou lote poderia ser cortado no meio (a recuperação ficaria por conta do visibility timeout e da idempotência, mas não é o caminho normal) |
+
+  Só o 137 é falha porque é o único que significa "o processo não respeitou o sinal". 0 e 143 são
+  paradas imediatas; a diferença é só se o handler já estava instalado.
+
 - **Healthcheck sem curl:** a imagem slim não tem curl; `src/entrypoints/healthcheck.ts` faz o
   `fetch` local.
 - **Conexões:** 9 processos × pool de 10 = 90 conexões; o Postgres de dev tem `max_connections=200`.
@@ -240,7 +261,13 @@ localstack (healthy = init concluído) ───────┼──► api ×3
 3. failover: com uma réplica parada, 20/20 requisições têm sucesso pelas outras duas. A primeira
    requisição que cai na réplica morta espera o `proxy_connect_timeout` (2 s) e é refeita em outra
    réplica, sem erro para o cliente; depois o DNS re-resolvido tira a réplica do pool;
-4. a réplica volta a `healthy` e o nginx volta a balancear entre 3.
+4. a réplica volta a `healthy` e o nginx volta a balancear entre 3;
+5. um `sqs-consumer` recebe `docker stop` logo depois de reiniciar (boot em andamento) e precisa sair
+   com 0 ou 143 em menos de 5 s (nunca 137);
+6. `docker compose stop` com a stack saudável: os 13 containers saem com exit 0, e cada container da
+   aplicação (API, workers, nginx) para em menos de 8 s contados do início do `stop`. O LocalStack
+   tem `stop_grace_period: 30s`: costuma parar em 2–3 s, mas com a stack inteira no ar já passou dos
+   10 s padrão e levou SIGKILL. Um travamento real dele continua falhando o smoke (137).
 
 **Migrations dentro da imagem** (`scripts/image-migrations-check.sh`, também no CI): roda
 `up → down → up` com as migrations do repositório e uma migration de sonda montada na pasta, na

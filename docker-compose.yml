@@ -27,6 +27,8 @@ x-app: &app
   build: .
   environment: *app-env
   restart: unless-stopped
+  # tini como PID 1 repassa os sinais; o handler de SIGTERM é instalado antes do boot (ver ARCHITECTURE.md).
+  init: true
   stop_grace_period: 15s
   depends_on:
     migrations:
@@ -72,6 +74,9 @@ services:
       LOCALSTACK_HOST: localstack:4566
       AWS_DEFAULT_REGION: us-east-1
       SQS_MAX_RECEIVE_COUNT: "5"
+    # O shutdown costuma levar 2-3 s, mas com a stack inteira no ar já passou dos 10 s padrão e levou
+    # SIGKILL (137). Folga para sair com 0; um travamento real continua aparecendo como 137 no smoke.
+    stop_grace_period: 30s
     volumes:
       - ./infra/localstack/init/ready.d:/etc/localstack/init/ready.d:ro
     ports:

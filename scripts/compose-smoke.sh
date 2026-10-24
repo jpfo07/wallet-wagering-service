@@ -3,8 +3,11 @@
 #   1. sobe tudo com --wait (healthchecks) e confere que as migrations saíram com 0;
 #   2. confere réplicas e saúde de cada serviço;
 #   3. 30 requisições pelo nginx precisam alcançar 3 instâncias distintas da API;
-#   4. failover: derruba uma réplica, o nginx continua respondendo pelas outras; depois ela volta.
-# Uso: scripts/compose-smoke.sh [--down]   (--down derruba a stack e os volumes no fim, como no CI)
+#   4. failover: derruba uma réplica, o nginx continua respondendo pelas outras; depois ela volta;
+#   5. SIGTERM durante o boot de um worker: para em poucos segundos com 0 ou 143, nunca 137 (SIGKILL);
+#   6. desligamento: `docker compose stop` com a stack saudável, todos os containers saem com 0.
+# Uso: scripts/compose-smoke.sh [--down]   (no fim a stack fica parada; --down também a remove com os
+# volumes, como no CI)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -90,5 +93,42 @@ wait_until 60 "réplica $victim_id voltar a healthy" is_healthy
 three_again() { [[ "$(instance_ids 30 | sort -u | grep -c .)" == "3" ]]; }
 wait_until 30 "nginx voltar a balancear entre 3 instâncias" three_again
 echo "ok: réplica voltou e o nginx balanceia entre 3 instâncias de novo"
+
+echo "==> SIGTERM durante o boot de um worker"
+worker=$(docker compose ps -q sqs-consumer | head -1)
+docker restart "$worker" >/dev/null # volta assim que o container inicia, com o boot em andamento
+started_ns=$(date +%s%N)
+docker stop -t 15 "$worker" >/dev/null
+elapsed_ms=$((($(date +%s%N) - started_ns) / 1000000))
+worker_exit=$(docker inspect --format '{{.State.ExitCode}}' "$worker")
+# 0: handler já instalado; 143: tini repassou o SIGTERM antes do handler existir; 137: SIGKILL.
+[[ "$worker_exit" == "0" || "$worker_exit" == "143" ]] || fail "worker parado no boot saiu com $worker_exit"
+((elapsed_ms < 5000)) || fail "worker parado no boot levou ${elapsed_ms}ms (limite 5000ms)"
+echo "ok: worker parado no boot saiu com $worker_exit em ${elapsed_ms}ms"
+docker start "$worker" >/dev/null
+worker_healthy() { [[ "$(docker inspect --format '{{.State.Health.Status}}' "$worker")" == "healthy" ]]; }
+wait_until 60 "worker voltar a healthy" worker_healthy
+
+echo "==> desligamento: todos os serviços param com exit 0"
+started_ns=$(date +%s%N)
+docker compose stop >/dev/null 2>&1
+elapsed_ms=$((($(date +%s%N) - started_ns) / 1000000))
+exits=$(docker compose ps -a --format '{{.Name}} {{.ExitCode}}')
+bad=$(awk '$2 != "0"' <<<"$exits")
+[[ -z "$bad" ]] || fail "containers que não saíram com 0: $(paste -sd' ' <<<"$bad")"
+total=$(grep -c . <<<"$exits")
+[[ "$total" == "13" ]] || fail "esperava 13 containers parados (12 serviços + migrations), vieram $total"
+# Prazo só para os nossos processos (param primeiro, por dependência); Postgres e LocalStack têm o
+# próprio grace period e só precisam sair com 0.
+slowest_ms=0
+for service in api sqs-consumer outbox-publisher pending-reference-worker nginx; do
+  for container in $(docker compose ps -aq "$service"); do
+    finished_ns=$(date -d "$(docker inspect --format '{{.State.FinishedAt}}' "$container")" +%s%N)
+    took_ms=$(((finished_ns - started_ns) / 1000000))
+    ((took_ms > slowest_ms)) && slowest_ms=$took_ms
+    ((took_ms < 8000)) || fail "$service ($container) levou ${took_ms}ms para parar (limite 8000ms)"
+  done
+done
+echo "ok: $total containers com exit 0; aplicação parada em até ${slowest_ms}ms (stop total ${elapsed_ms}ms)"
 
 echo "SMOKE OK"

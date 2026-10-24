@@ -1,12 +1,5 @@
-import "reflect-metadata";
-import { NestFactory } from "@nestjs/core";
-import { MikroORM } from "@mikro-orm/core";
 import type { SQSClient } from "@aws-sdk/client-sqs";
 import { loadConfig } from "../infrastructure/config/env.ts";
-import { SQS_CLIENT } from "../infrastructure/messaging/messaging.module.ts";
-import { checkReadiness } from "../infrastructure/observability/readiness.ts";
-import { startWorkerHealthServer } from "../infrastructure/observability/worker-health-server.ts";
-import { WorkerModule } from "../infrastructure/worker.module.ts";
 import { installGracefulShutdown } from "./graceful-shutdown.ts";
 
 export type WorkerName = "sqs-consumer" | "outbox-publisher" | "pending-reference-worker";
@@ -25,6 +18,26 @@ export async function runWorker(name: WorkerName): Promise<void> {
     );
   };
 
+  // Signal handler first, heavy modules after it (see graceful-shutdown.ts).
+  const shutdown = installGracefulShutdown({ timeoutMs: 10_000, log });
+  log("starting");
+  await import("reflect-metadata");
+  const [
+    { NestFactory },
+    { MikroORM },
+    { SQS_CLIENT },
+    { checkReadiness },
+    { startWorkerHealthServer },
+    { WorkerModule },
+  ] = await Promise.all([
+    import("@nestjs/core"),
+    import("@mikro-orm/core"),
+    import("../infrastructure/messaging/messaging.module.ts"),
+    import("../infrastructure/observability/readiness.ts"),
+    import("../infrastructure/observability/worker-health-server.ts"),
+    import("../infrastructure/worker.module.ts"),
+  ]);
+
   const app = await NestFactory.createApplicationContext(WorkerModule, {
     logger: ["error", "warn"],
   });
@@ -42,7 +55,10 @@ export async function runWorker(name: WorkerName): Promise<void> {
         queueName: config.sqs.wagerQueueName,
       }),
   });
-  installGracefulShutdown(app, { timeoutMs: 10_000, log, beforeClose: () => health.stop() });
+  shutdown.register(async () => {
+    await health.stop();
+    await app.close();
+  });
 
   log(`started (health on port ${health.port}); no work loop yet — placeholder until its phase`);
 }

@@ -151,5 +151,50 @@ describe("spike A — NestJS on Bun", () => {
         }
       });
     }
+
+    // Regression: the handler used to be installed only after boot, so a SIGTERM during boot
+    // was ignored by PID 1 in the container and the process was SIGKILLed (exit 137).
+    for (const entrypoint of [
+      "api",
+      "sqs-consumer",
+      "outbox-publisher",
+      "pending-reference-worker",
+    ]) {
+      test(`A3c: ${entrypoint} exits 0 on a SIGTERM received during boot`, async () => {
+        const child = Bun.spawn(["bun", "run", `src/entrypoints/${entrypoint}.ts`], {
+          cwd: new URL("../../../", import.meta.url).pathname,
+          env: childProcessEnv(db.config, {
+            HTTP_PORT: String(freePort()),
+            WORKER_HEALTH_PORT: String(freePort()),
+            INSTANCE_ID: `spike-boot-${entrypoint}`,
+          }),
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        let stdout = "";
+        const drained = (async () => {
+          const decoder = new TextDecoder();
+          for await (const chunk of child.stdout) stdout += decoder.decode(chunk, { stream: true });
+        })();
+        try {
+          // "starting" is logged right after the handler is installed, before Nest is loaded.
+          await waitFor(() => stdout.includes('"starting"'), {
+            timeoutMs: 10_000,
+            intervalMs: 5,
+            description: `${entrypoint} to log "starting"`,
+          });
+          child.kill("SIGTERM");
+          const exitCode = await Promise.race([
+            child.exited,
+            Bun.sleep(5_000).then(() => "timeout" as const),
+          ]);
+          expect(exitCode).toBe(0);
+          await drained;
+          expect(stdout).toContain("received SIGTERM");
+        } finally {
+          if (child.exitCode === null) child.kill("SIGKILL");
+        }
+      });
+    }
   });
 });
