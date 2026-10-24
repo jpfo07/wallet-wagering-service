@@ -1,0 +1,58 @@
+# Stack de testes: separada da de dev (projeto e portas próprios), descartável.
+# Uso: bun run test:infra:up  /  bun run test:infra:down
+name: wws-test
+
+services:
+  postgres:
+    image: postgres:18.6-alpine@sha256:3b0ef735388b2cb097fc29b8bb421d86d57d0ddbe7aa1fbd6493e06d65028503
+    environment:
+      POSTGRES_USER: wallet
+      POSTGRES_PASSWORD: wallet
+      POSTGRES_DB: wallet
+    # Durabilidade desligada de propósito: os dados de teste são descartáveis.
+    command:
+      - postgres
+      - -c
+      - fsync=off
+      - -c
+      - synchronous_commit=off
+      - -c
+      - full_page_writes=off
+      - -c
+      - max_connections=300
+    # PostgreSQL 18+: o VOLUME da imagem é /var/lib/postgresql (PGDATA = /var/lib/postgresql/18/docker).
+    tmpfs:
+      - /var/lib/postgresql
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wallet -d wallet"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  localstack:
+    # Última imagem community (Apache 2.0); fixada por tag + digest.
+    image: localstack/localstack:4.14.0@sha256:75ba7a4bda54a3020019fba23e99c61bbff7dbf23eea12919e5b75b15c6f03f2
+    environment:
+      SERVICES: sqs
+      # No 4.14.0, "off" gera http://<LOCALSTACK_HOST>/<conta>/<fila> ("path" acrescenta /queue/<região>).
+      # O host vem de LOCALSTACK_HOST: o nome do serviço na rede do compose, nunca *.localstack.cloud.
+      SQS_ENDPOINT_STRATEGY: "off"
+      LOCALSTACK_HOST: localstack:4566
+      AWS_DEFAULT_REGION: us-east-1
+      SQS_MAX_RECEIVE_COUNT: "5"
+    volumes:
+      - ./infra/localstack/init/ready.d:/etc/localstack/init/ready.d:ro
+    ports:
+      - "54566:4566"
+    healthcheck:
+      # Saudável só quando os scripts de init terminaram (filas criadas).
+      test:
+        [
+          "CMD-SHELL",
+          'curl -fsS http://localhost:4566/_localstack/init/ready | grep -q ''"completed": true''',
+        ]
+      interval: 2s
+      timeout: 3s
+      retries: 60
