@@ -1,0 +1,55 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: lint, typecheck e testes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      # Actions fixadas por SHA de commit (a tag fica no comentário).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      - run: bun install --frozen-lockfile
+      - run: bun run format:check
+      - run: bun run lint
+      - run: bun run typecheck
+      - run: bun run test:unit
+      - name: sobe a stack de testes (PostgreSQL + LocalStack)
+        run: bun run test:infra:up
+      - run: bun run test:integration
+      - name: logs da stack de testes
+        if: failure()
+        run: docker compose -f docker-compose.test.yml logs --tail=100
+      - if: always()
+        run: bun run test:infra:down
+
+  image-and-compose:
+    name: imagem, migrations na imagem e smoke multi-instância
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: build da imagem de produção
+        run: docker build -t wallet-wagering-service:dev .
+      - name: sobe a stack de testes (PostgreSQL + LocalStack)
+        run: docker compose -f docker-compose.test.yml up -d --wait
+      - name: migrations dentro da imagem construída
+        run: bash scripts/image-migrations-check.sh wallet-wagering-service:dev
+      - name: smoke da stack de dev (3 APIs atrás do nginx, workers replicados, failover)
+        run: bash scripts/compose-smoke.sh --down
+      - if: always()
+        run: docker compose -f docker-compose.test.yml down -v

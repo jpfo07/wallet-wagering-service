@@ -42,6 +42,7 @@ describe("spike A — NestJS on Bun", () => {
       const config: AppConfig = {
         instanceId: "spike-instance",
         httpPort: 0,
+        workerHealthPort: 0,
         database: db.config,
         sqs: testSqsConfig(),
       };
@@ -113,5 +114,42 @@ describe("spike A — NestJS on Bun", () => {
         if (child.exitCode === null) child.kill("SIGKILL");
       }
     });
+
+    for (const worker of ["sqs-consumer", "outbox-publisher", "pending-reference-worker"]) {
+      test(`A3b: ${worker} entrypoint is healthy and exits 0 on SIGTERM`, async () => {
+        const port = freePort();
+        const child = Bun.spawn(["bun", "run", `src/entrypoints/${worker}.ts`], {
+          cwd: new URL("../../../", import.meta.url).pathname,
+          env: childProcessEnv(db.config, {
+            WORKER_HEALTH_PORT: String(port),
+            INSTANCE_ID: `spike-${worker}`,
+          }),
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        try {
+          await waitFor(async () => (await fetch(`http://127.0.0.1:${port}/health/live`)).ok, {
+            timeoutMs: 20_000,
+            description: `${worker} to become live`,
+          });
+          const ready = await fetch(`http://127.0.0.1:${port}/health/ready`);
+          expect(ready.status).toBe(200);
+          expect(await ready.json()).toEqual({
+            status: "ok",
+            checks: { postgres: "up", sqs: "up" },
+          });
+
+          child.kill("SIGTERM");
+          const exitCode = await Promise.race([
+            child.exited,
+            Bun.sleep(15_000).then(() => "timeout" as const),
+          ]);
+          expect(exitCode).toBe(0);
+          expect(await new Response(child.stdout).text()).toContain("shutdown complete");
+        } finally {
+          if (child.exitCode === null) child.kill("SIGKILL");
+        }
+      });
+    }
   });
 });

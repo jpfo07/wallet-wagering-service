@@ -1,11 +1,11 @@
 import { Controller, Get, Inject, ServiceUnavailableException } from "@nestjs/common";
 import { MikroORM } from "@mikro-orm/core";
-import { GetQueueUrlCommand, SQSClient } from "@aws-sdk/client-sqs";
+import { SQSClient } from "@aws-sdk/client-sqs";
 import { APP_CONFIG } from "../config/config.module.ts";
 import type { AppConfig } from "../config/env.ts";
 import { SQS_CLIENT } from "../messaging/messaging.module.ts";
-
-type CheckResult = "up" | "down";
+import { checkReadiness } from "../observability/readiness.ts";
+import type { ReadinessReport } from "../observability/readiness.ts";
 
 @Controller("health")
 export class HealthController {
@@ -23,30 +23,15 @@ export class HealthController {
 
   /** Readiness: PostgreSQL and SQS must be reachable. */
   @Get("ready")
-  async ready(): Promise<{ status: "ok"; checks: Record<string, CheckResult> }> {
-    const [postgres, sqs] = await Promise.all([this.checkPostgres(), this.checkSqs()]);
-    const checks = { postgres, sqs };
-    if (postgres === "down" || sqs === "down") {
-      throw new ServiceUnavailableException({ status: "unavailable", checks });
+  async ready(): Promise<{ status: "ok"; checks: ReadinessReport["checks"] }> {
+    const report = await checkReadiness({
+      pingPostgres: () => this.orm.em.getConnection().execute("select 1"),
+      sqs: this.sqs,
+      queueName: this.config.sqs.wagerQueueName,
+    });
+    if (!report.ready) {
+      throw new ServiceUnavailableException({ status: "unavailable", checks: report.checks });
     }
-    return { status: "ok", checks };
-  }
-
-  private async checkPostgres(): Promise<CheckResult> {
-    try {
-      await this.orm.em.getConnection().execute("select 1");
-      return "up";
-    } catch {
-      return "down";
-    }
-  }
-
-  private async checkSqs(): Promise<CheckResult> {
-    try {
-      await this.sqs.send(new GetQueueUrlCommand({ QueueName: this.config.sqs.wagerQueueName }));
-      return "up";
-    } catch {
-      return "down";
-    }
+    return { status: "ok", checks: report.checks };
   }
 }

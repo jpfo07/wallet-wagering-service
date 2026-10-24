@@ -23,6 +23,8 @@ export interface SqsConfig {
 export interface AppConfig {
   readonly instanceId: string;
   readonly httpPort: number;
+  /** Internal health port of worker processes. */
+  readonly workerHealthPort: number;
   readonly database: DatabaseConfig;
   readonly sqs: SqsConfig;
 }
@@ -57,6 +59,7 @@ export function loadConfig(source: Source = process.env): AppConfig {
   return {
     instanceId: str(source, "INSTANCE_ID", hostname()),
     httpPort: int(source, "HTTP_PORT", 3000),
+    workerHealthPort: int(source, "WORKER_HEALTH_PORT", 9100),
     database: {
       host: str(source, "DATABASE_HOST"),
       port: int(source, "DATABASE_PORT", 5432),

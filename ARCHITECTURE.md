@@ -58,6 +58,7 @@ PostgreSQL e LocalStack reais:
 | A1      | O transpilador do Bun emite `design:paramtypes`: DI do Nest por tipo, com classes importadas de outros módulos     |
 | A2      | `bun test` sobe o `ApiModule` real (`Test.createTestingModule`) e serve HTTP; `/health/ready` checa Postgres + SQS |
 | A3      | O entrypoint da API sai com código 0 no `SIGTERM`, depois dos shutdown hooks do Nest                               |
+| A3b     | Os entrypoints dos 3 workers respondem `/health/live` e `/health/ready` e saem com 0 no `SIGTERM`                  |
 | B4      | `MikroOrmModule` + `RequestContext`: cada requisição recebe um `EntityManager` próprio                             |
 | B5      | `numeric(20,2)` faz ida e volta como **string** exata (`"12345678901234567.89"`, `"0.10"`)                         |
 | B6      | `PESSIMISTIC_WRITE` gera `SELECT ... FOR UPDATE`                                                                   |
@@ -73,8 +74,8 @@ digest), na rede da stack de testes:
 
 | Bun    | `install --frozen-lockfile` | typecheck | unit | integração      | `fs.globSync({ withFileTypes })` | lockfile   |
 | ------ | --------------------------- | --------- | ---- | --------------- | -------------------------------- | ---------- |
-| 1.3.14 | ok                          | ok        | ok   | 17 pass, 0 fail | **não suportado**                | inalterado |
-| 1.4.4  | ok                          | ok        | ok   | 17 pass, 0 fail | ok                               | inalterado |
+| 1.3.14 | ok                          | ok        | ok   | 20 pass, 0 fail | **não suportado**                | inalterado |
+| 1.4.4  | ok                          | ok        | ok   | 20 pass, 0 fail | ok                               | inalterado |
 
 Os tempos medidos (boot da API, duração das etapas) variaram mais entre duas rodadas da mesma versão
 do que entre versões. Com essa amostra não dá para afirmar diferença de desempenho; por isso eles não
@@ -195,3 +196,64 @@ o script de init terminou, ou seja, as filas já existem.
 - **Filas por suíte:** cada suíte cria a própria topologia (DLQ, principal com redrive, eventos) com
   prefixo único e a apaga no fim. `PurgeQueue` é evitado (janela de 60 s na AWS).
 - **Sem `sleep` para esperar dar certo:** `waitFor()` faz polling com timeout.
+
+## 6. Orquestração local e multi-instância
+
+`docker-compose.yml` sobe a solução no formato em que ela precisa estar correta: **várias
+instâncias de cada processo ao mesmo tempo**. Uma única imagem serve todos os processos; o serviço
+escolhe o comando.
+
+```
+postgres (healthy) ──► migrations (exit 0) ──┐
+localstack (healthy = init concluído) ───────┼──► api ×3 (healthy) ──► nginx :8080
+                                             └──► sqs-consumer ×2 · outbox-publisher ×2 · pending-reference-worker ×2
+```
+
+- **Ordem de subida pelos healthchecks, não pela ordem de declaração:** `depends_on` com
+  `service_healthy` e `service_completed_successfully`. O LocalStack só fica saudável quando o script
+  de init terminou, ou seja, as filas existem antes de qualquer consumidor subir.
+- **Migrations num serviço próprio, que roda uma vez:** as réplicas da API nunca disputam a execução de
+  migrations no boot, e se a migration falhar nenhuma aplicação sobe.
+- **Uma única porta da API (8080, no nginx).** Postgres e LocalStack ficam expostos só em `127.0.0.1`,
+  para ferramentas locais.
+- **nginx na frente das 3 APIs:**
+  - `resolver 127.0.0.11 valid=5s` + `server api:3000 resolve` (nginx ≥ 1.27.3): o nome `api` resolve
+    para os IPs de todas as réplicas e é reavaliado continuamente; uma réplica que reinicia com outro
+    IP volta ao pool sozinha.
+  - `proxy_next_upstream error timeout http_502 http_503`: se uma réplica não responde, a requisição é
+    refeita em outra, **só para métodos idempotentes**. O nginx nunca reenvia POST. Quem reenvia uma
+    transação é o provedor, e a idempotência persistente protege esse caso.
+  - Cada resposta traz `X-Instance-Id` (definido pela API) e `X-Upstream-Addr` (definido pelo nginx),
+    o que deixa visível qual réplica atendeu.
+- **Workers** (placeholders até as Fases 5 e 6): sobem o contexto Nest (DI, ORM, cliente SQS) e um
+  servidor HTTP interno (`WORKER_HEALTH_PORT`, 9100) com `/health/live` e `/health/ready`. No SIGTERM
+  saem com 0 depois de fechar o pool e o cliente SQS. A readiness da API e a dos workers usam a mesma
+  função (`checkReadiness`).
+- **Healthcheck sem curl:** a imagem slim não tem curl; `src/entrypoints/healthcheck.ts` faz o
+  `fetch` local.
+- **Conexões:** 9 processos × pool de 10 = 90 conexões; o Postgres de dev tem `max_connections=200`.
+
+**Prova automatizada** (`scripts/compose-smoke.sh`, também no CI):
+
+1. todos os serviços `healthy`, na quantidade esperada de réplicas, e migrations com exit 0;
+2. 30 requisições pelo nginx atendidas por 3 instâncias distintas (na execução local: 10/10/10);
+3. failover: com uma réplica parada, 20/20 requisições têm sucesso pelas outras duas. A primeira
+   requisição que cai na réplica morta espera o `proxy_connect_timeout` (2 s) e é refeita em outra
+   réplica, sem erro para o cliente; depois o DNS re-resolvido tira a réplica do pool;
+4. a réplica volta a `healthy` e o nginx volta a balancear entre 3.
+
+**Migrations dentro da imagem** (`scripts/image-migrations-check.sh`, também no CI): roda
+`up → down → up` com as migrations do repositório e uma migration de sonda montada na pasta, na
+imagem instalada com `--production`. Isso pega dependência que só existe no host (seção 3).
+
+## 7. CI (GitHub Actions)
+
+Dois jobs. Nenhum deles mocka PostgreSQL ou SQS.
+
+- **checks:** Bun pela `.bun-version`, `bun install --frozen-lockfile`, prettier, lint, typecheck,
+  testes unitários e, com a stack de testes no ar, os testes de integração.
+- **image-and-compose:** build da imagem de produção, migrations dentro da imagem e o smoke
+  multi-instância completo da stack de dev.
+
+As actions são fixadas por SHA de commit (a tag fica no comentário), pelo mesmo motivo das imagens
+fixadas por digest: uma tag pode ser movida, um SHA não.

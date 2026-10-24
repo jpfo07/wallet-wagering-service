@@ -22,7 +22,9 @@
     "migration:up": "bun run src/entrypoints/migrate.ts up",
     "migration:down": "bun run src/entrypoints/migrate.ts down",
     "migration:create": "bun run src/entrypoints/migrate.ts create",
-    "compat:matrix": "bash scripts/bun-compat-matrix.sh"
+    "compat:matrix": "bash scripts/bun-compat-matrix.sh",
+    "compose:smoke": "bash scripts/compose-smoke.sh",
+    "image:migrations-check": "bash scripts/image-migrations-check.sh"
   },
   "dependencies": {
     "@aws-sdk/client-sqs": "3.1152.0",
