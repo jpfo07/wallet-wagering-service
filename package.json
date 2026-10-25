@@ -10,8 +10,8 @@
   "scripts": {
     "start:api": "bun run src/entrypoints/api.ts",
     "lint": "eslint .",
-    "format": "prettier --write .",
-    "format:check": "prettier --check .",
+    "format": "git ls-files -z --cached --others --exclude-standard | xargs -0 prettier --write --ignore-unknown",
+    "format:check": "git ls-files -z --cached --others --exclude-standard | xargs -0 prettier --check --ignore-unknown",
     "typecheck": "tsc --noEmit",
     "test": "bun test --timeout=30000",
     "test:unit": "bun test --timeout=30000 test/unit",

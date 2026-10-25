@@ -1,11 +1,7 @@
-node_modules
-.git
-.github
-.env
-.env.*
-!.env.example
-test
-scripts
-coverage
-docs
-*.log
+# Whitelist: o contexto de build leva só o que o Dockerfile copia.
+*
+!package.json
+!bun.lock
+!bunfig.toml
+!tsconfig.json
+!src
