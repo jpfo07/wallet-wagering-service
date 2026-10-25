@@ -24,7 +24,9 @@ describe("readiness", () => {
   });
 
   test("worker health server: 503 when not ready, live stays 200, /metrics exposes the registry", async () => {
+    let started = false;
     const server = startWorkerHealthServer({
+      isStarted: () => started,
       port: 0,
       processName: "outbox-publisher",
       instanceId: "w-1",
@@ -39,6 +41,11 @@ describe("readiness", () => {
     try {
       const base = `http://127.0.0.1:${server.port}`;
       expect((await fetch(`${base}/health/live`)).status).toBe(200);
+      // The loop has not started yet: not ready, whatever the dependencies say.
+      const starting = await fetch(`${base}/health/ready`);
+      expect(starting.status).toBe(503);
+      expect(await starting.json()).toEqual({ status: "starting" });
+      started = true;
       const ready = await fetch(`${base}/health/ready`);
       expect(ready.status).toBe(503);
       expect(await ready.json()).toEqual({

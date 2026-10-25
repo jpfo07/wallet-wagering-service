@@ -3,6 +3,7 @@ import { MikroOrmModule } from "@mikro-orm/nestjs";
 import { PostgreSqlDriver } from "@mikro-orm/postgresql";
 import { APP_CONFIG } from "../config/config.module.ts";
 import type { AppConfig } from "../config/env.ts";
+import { DatabaseProbe } from "./database-probe.ts";
 import { buildOrmOptions } from "./mikro-orm.config.ts";
 
 @Module({
@@ -13,5 +14,7 @@ import { buildOrmOptions } from "./mikro-orm.config.ts";
       useFactory: (config: AppConfig) => buildOrmOptions(config.database),
     }),
   ],
+  providers: [DatabaseProbe],
+  exports: [DatabaseProbe],
 })
 export class PersistenceModule {}

@@ -6,6 +6,7 @@ import { APP_CONFIG } from "../../../src/infrastructure/config/config.module.ts"
 import type { AppConfig } from "../../../src/infrastructure/config/env.ts";
 import { ApiModule } from "../../../src/infrastructure/http/api.module.ts";
 import { HealthController } from "../../../src/infrastructure/http/health.controller.ts";
+import { DatabaseProbe } from "../../../src/infrastructure/persistence/database-probe.ts";
 import { createIsolatedDatabase } from "../../support/database.ts";
 import type { IsolatedDatabase } from "../../support/database.ts";
 import {
@@ -76,9 +77,11 @@ describe("spike A — NestJS on Bun", () => {
     });
 
     test("A2: bun test boots a Nest module and serves real HTTP", async () => {
-      // HealthController injects MikroORM by type, imported from a package.
+      // Injection by type: HealthController → DatabaseProbe (local class) → MikroORM (package).
       const paramTypes: unknown = Reflect.getMetadata("design:paramtypes", HealthController);
-      expect(Array.isArray(paramTypes) && paramTypes[0] === MikroORM).toBe(true);
+      expect(Array.isArray(paramTypes) && paramTypes[0] === DatabaseProbe).toBe(true);
+      const probeTypes: unknown = Reflect.getMetadata("design:paramtypes", DatabaseProbe);
+      expect(Array.isArray(probeTypes) && probeTypes[0] === MikroORM).toBe(true);
 
       const live = await fetch(`${baseUrl}/health/live`);
       expect(live.status).toBe(200);
@@ -146,16 +149,15 @@ describe("spike A — NestJS on Bun", () => {
           stderr: "pipe",
         });
         try {
-          await waitFor(async () => (await fetch(`http://127.0.0.1:${port}/health/live`)).ok, {
-            timeoutMs: 20_000,
-            description: `${worker} to become live`,
-          });
-          const ready = await fetch(`http://127.0.0.1:${port}/health/ready`);
-          expect(ready.status).toBe(200);
-          expect(await ready.json()).toEqual({
-            status: "ok",
-            checks: { postgres: "up", sqs: "up" },
-          });
+          // Live comes up before the loop has started; ready only once it runs.
+          const ready = await waitFor(
+            async () => {
+              const response = await fetch(`http://127.0.0.1:${port}/health/ready`);
+              return response.status === 200 ? await response.json() : undefined;
+            },
+            { timeoutMs: 20_000, description: `${worker} to become ready` },
+          );
+          expect(ready).toEqual({ status: "ok", checks: { postgres: "up", sqs: "up" } });
           const metrics = await fetch(`http://127.0.0.1:${port}/metrics`);
           expect(metrics.status).toBe(200);
           const exposition = await metrics.text();
@@ -168,8 +170,10 @@ describe("spike A — NestJS on Bun", () => {
             child.exited,
             Bun.sleep(15_000).then(() => "timeout" as const),
           ]);
-          expect(exitCode).toBe(0);
           const stdout = await new Response(child.stdout).text();
+          const stderr = await new Response(child.stderr).text();
+          // On failure the message carries the process output: it says which step went wrong.
+          expect(exitCode, `stdout:\n${stdout}\nstderr:\n${stderr}`).toBe(0);
           expect(stdout).toContain("shutdown complete");
           // Every line is one JSON object of the same shape (boot log and pino alike).
           for (const line of stdout.trim().split("\n")) {
@@ -183,6 +187,44 @@ describe("spike A — NestJS on Bun", () => {
         }
       });
     }
+
+    // Regression (flaky A3b): a SIGTERM while the loop was still starting closed the ORM under a
+    // probe that was opening the pool's first connection, and the close hung until the deadline
+    // (exit 1). Now the shutdown waits for the start and for the probes in flight.
+    test("A3d: sqs-consumer exits 0 on a SIGTERM sent as soon as it is live (loop still starting)", async () => {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const port = freePort();
+        const child = Bun.spawn(["bun", "run", "src/entrypoints/sqs-consumer.ts"], {
+          cwd: new URL("../../../", import.meta.url).pathname,
+          env: childProcessEnv(db.config, {
+            WORKER_HEALTH_PORT: String(port),
+            INSTANCE_ID: `spike-a3d-${attempt}`,
+          }),
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        try {
+          await waitFor(async () => (await fetch(`http://127.0.0.1:${port}/health/live`)).ok, {
+            timeoutMs: 20_000,
+            intervalMs: 5,
+            description: "sqs-consumer to become live",
+          });
+          child.kill("SIGTERM");
+          const exitCode = await Promise.race([
+            child.exited,
+            Bun.sleep(15_000).then(() => "timeout" as const),
+          ]);
+          const stdout = await new Response(child.stdout).text();
+          expect(exitCode, `stdout:\n${stdout}`).toBe(0);
+          expect(stdout).toContain("shutdown complete");
+          // A loop that managed to start is stopped, never left running under a closed app.
+          if (stdout.includes("sqs consumer started"))
+            expect(stdout).toContain("sqs consumer stopped");
+        } finally {
+          if (child.exitCode === null) child.kill("SIGKILL");
+        }
+      }
+    });
 
     // Regression: the handler used to be installed only after boot, so a SIGTERM during boot
     // was ignored by PID 1 in the container and the process was SIGKILLed (exit 137).

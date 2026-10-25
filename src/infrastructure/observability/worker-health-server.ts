@@ -16,6 +16,8 @@ export function startWorkerHealthServer(options: {
   readonly processName: string;
   readonly instanceId: string;
   readonly metrics: Registry;
+  /** False while the work loop is still booting: readiness answers 503 "starting". */
+  readonly isStarted: () => boolean;
   readonly readiness: () => Promise<ReadinessReport>;
 }): WorkerHealthServer {
   const server = Bun.serve({
@@ -31,6 +33,9 @@ export function startWorkerHealthServer(options: {
         });
       }
       if (pathname === "/health/ready") {
+        if (!options.isStarted()) {
+          return Response.json({ status: "starting" }, { status: 503 });
+        }
         const report = await options.readiness();
         return Response.json(
           { status: report.ready ? "ok" : "unavailable", checks: report.checks },

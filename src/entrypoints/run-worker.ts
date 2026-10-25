@@ -65,7 +65,7 @@ export async function runWorker(name: WorkerName, start: StartWorkLoop): Promise
   await import("reflect-metadata");
   const [
     { NestFactory },
-    { MikroORM },
+    { DatabaseProbe },
     { SQS_CLIENT },
     { PROCESS_TELEMETRY },
     { NestLoggerAdapter },
@@ -74,7 +74,7 @@ export async function runWorker(name: WorkerName, start: StartWorkLoop): Promise
     { WorkerModule },
   ] = await Promise.all([
     import("@nestjs/core"),
-    import("@mikro-orm/core"),
+    import("../infrastructure/persistence/database-probe.ts"),
     import("../infrastructure/messaging/messaging.module.ts"),
     import("../infrastructure/observability/observability.module.ts"),
     import("../infrastructure/observability/nest-logger.adapter.ts"),
@@ -89,7 +89,7 @@ export async function runWorker(name: WorkerName, start: StartWorkLoop): Promise
   app.useLogger(
     new NestLoggerAdapter(app.get<ProcessTelemetry>(PROCESS_TELEMETRY).logger, ["error", "warn"]),
   );
-  const orm = app.get(MikroORM);
+  const database = app.get(DatabaseProbe);
   const sqs = app.get<SQSClient>(SQS_CLIENT);
   const { registry } = app.get<ProcessTelemetry>(PROCESS_TELEMETRY);
 
@@ -98,21 +98,28 @@ export async function runWorker(name: WorkerName, start: StartWorkLoop): Promise
     processName: name,
     instanceId: config.instanceId,
     metrics: registry,
+    // Ready only once the loop runs: before that the process takes no work.
+    isStarted: () => loop !== undefined,
     readiness: () =>
       checkReadiness({
-        pingPostgres: () => orm.em.getConnection().execute("select 1"),
+        pingPostgres: () => database.ping(),
         sqs,
         queueName: config.sqs.wagerQueueName,
       }),
   });
-  // Assigned once the loop started; a SIGTERM during its boot checks finds it still undefined.
+  // Assigned once the loop started (readiness waits for it).
   let loop: WorkLoop | undefined = undefined;
+  // A SIGTERM while `start` is still running (boot checks, first queries) waits for it and then
+  // stops the loop it produced: closing the application under a starting loop would pull the ORM
+  // and the SQS client from under it. A start that failed has nothing to stop.
+  const starting = start(app, config);
   shutdown.register(async () => {
-    await loop?.stop();
+    const started = await starting.catch(() => undefined);
+    await started?.stop();
     await health.stop();
     await app.close();
   });
 
-  loop = await start(app, config);
+  loop = await starting;
   log(`started (health on port ${health.port})`);
 }

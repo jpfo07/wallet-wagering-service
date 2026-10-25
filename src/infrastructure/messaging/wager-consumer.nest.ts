@@ -1,9 +1,9 @@
 import type { INestApplicationContext } from "@nestjs/common";
-import { MikroORM } from "@mikro-orm/core";
 import type { SQSClient } from "@aws-sdk/client-sqs";
 import { APPLICATION } from "../application/application.module.ts";
 import type { Application } from "../application/composition.ts";
 import type { AppConfig } from "../config/env.ts";
+import { DatabaseProbe } from "../persistence/database-probe.ts";
 import { PROCESS_TELEMETRY } from "../observability/observability.module.ts";
 import type { ProcessTelemetry } from "../observability/process-telemetry.ts";
 import { PrometheusConsumerMetrics } from "../observability/prometheus-metrics.ts";
@@ -16,7 +16,7 @@ export function startWagerConsumerInNest(
   app: INestApplicationContext,
   config: AppConfig,
 ): Promise<RunningWagerConsumer> {
-  const orm = app.get(MikroORM);
+  const database = app.get(DatabaseProbe);
   const application = app.get<Application>(APPLICATION);
   const { clock, random, logger } = application.dependencies;
   const { registry } = app.get<ProcessTelemetry>(PROCESS_TELEMETRY);
@@ -27,7 +27,7 @@ export function startWagerConsumerInNest(
     database: config.database,
     transientRetry: config.transientRetry,
     processWager: application.processWagerTransaction,
-    pingDatabase: () => orm.em.getConnection().execute("select 1"),
+    pingDatabase: () => database.ping(),
     clock,
     random,
     logger,

@@ -1,11 +1,11 @@
 import { Controller, Get, Inject, Res } from "@nestjs/common";
-import { MikroORM } from "@mikro-orm/core";
 import { SQSClient } from "@aws-sdk/client-sqs";
 import { Public } from "../auth/public.decorator.ts";
 import { APP_CONFIG } from "../config/config.module.ts";
 import type { AppConfig } from "../config/env.ts";
 import { SQS_CLIENT } from "../messaging/messaging.module.ts";
 import { checkReadiness } from "../observability/readiness.ts";
+import { DatabaseProbe } from "../persistence/database-probe.ts";
 import type { ReadinessReport } from "../observability/readiness.ts";
 import type { HttpResponse } from "./request-context.decorator.ts";
 
@@ -14,7 +14,7 @@ import type { HttpResponse } from "./request-context.decorator.ts";
 @Controller("health")
 export class HealthController {
   constructor(
-    private readonly orm: MikroORM,
+    private readonly database: DatabaseProbe,
     @Inject(SQS_CLIENT) private readonly sqs: SQSClient,
     @Inject(APP_CONFIG) private readonly config: AppConfig,
   ) {}
@@ -34,7 +34,7 @@ export class HealthController {
     @Res({ passthrough: true }) response: HttpResponse,
   ): Promise<{ status: "ok" | "unavailable"; checks: ReadinessReport["checks"] }> {
     const report = await checkReadiness({
-      pingPostgres: () => this.orm.em.getConnection().execute("select 1"),
+      pingPostgres: () => this.database.ping(),
       sqs: this.sqs,
       queueName: this.config.sqs.wagerQueueName,
     });
