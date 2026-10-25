@@ -24,6 +24,8 @@ x-app-env: &app-env
   SQS_WAGER_QUEUE_NAME: wager-transactions.fifo
   SQS_WAGER_DLQ_NAME: wager-transactions-dlq.fifo
   SQS_EVENTS_QUEUE_NAME: wallet-events.fifo
+  SQS_CONSUMER_CONCURRENCY: "4"
+  SQS_SHUTDOWN_DRAIN_MS: "8000"
   HTTP_PORT: "3000"
   WORKER_HEALTH_PORT: "9100"
 
@@ -80,6 +82,7 @@ services:
       LOCALSTACK_HOST: localstack:4566
       AWS_DEFAULT_REGION: us-east-1
       SQS_MAX_RECEIVE_COUNT: "5"
+      SQS_VISIBILITY_TIMEOUT_SECONDS: "60"
     # O shutdown costuma levar 2-3 s, mas com a stack inteira no ar já passou dos 10 s padrão e levou
     # SIGKILL (137). Folga para sair com 0; um travamento real continua aparecendo como 137 no smoke.
     stop_grace_period: 30s

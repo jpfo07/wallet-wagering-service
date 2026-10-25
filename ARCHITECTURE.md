@@ -174,7 +174,7 @@ por teste unitário (configuração resolvida) e de integração (C10b).
 
 **Filas** (criadas por `infra/localstack/init/ready.d/01-create-queues.sh`):
 `wager-transactions-dlq.fifo` → `wager-transactions.fifo` (redrive, `maxReceiveCount` por env, padrão
-5, `VisibilityTimeout` 30 s) → `wallet-events.fifo`. O healthcheck do LocalStack só fica verde quando
+5, `VisibilityTimeout` 60 s, ver seção 12) → `wallet-events.fifo`. O healthcheck do LocalStack só fica verde quando
 o script de init terminou, ou seja, as filas já existem.
 
 ## 5. Ambiente de testes
@@ -227,7 +227,8 @@ localstack (healthy = init concluído) ───────┼──► api ×3
     transação é o provedor, e a idempotência persistente protege esse caso.
   - Cada resposta traz `X-Instance-Id` (definido pela API) e `X-Upstream-Addr` (definido pelo nginx),
     o que deixa visível qual réplica atendeu.
-- **Workers** (placeholders até as Fases 5 e 6): sobem o contexto Nest (DI, ORM, cliente SQS) e um
+- **Workers** (o `sqs-consumer` tem loop desde a Fase 5; os outros dois são placeholders até a
+  Fase 6): sobem o contexto Nest (DI, ORM, cliente SQS) e um
   servidor HTTP interno (`WORKER_HEALTH_PORT`, 9100) com `/health/live` e `/health/ready`. No SIGTERM
   saem com 0 depois de fechar o pool e o cliente SQS. A readiness da API e a dos workers usam a mesma
   função (`checkReadiness`).
@@ -857,23 +858,8 @@ quem não quer a OPENING filtra pelo `kind`. Com saldo zero não há evento.
 ### Limitações e próximos passos
 
 - Métricas em memória por processo e logger JSON simples até a Fase 7 (pino + `/metrics`).
-- **VisibilityTimeout × pior caso de processamento (para a Fase 5).** A mensagem precisa continuar
-  invisível enquanto é processada; senão outra instância a recebe no meio. Isso não duplica efeito
-  (idempotência), mas gasta tentativas e polui a DLQ. Pior caso com os valores atuais
-  (`DATABASE_TRANSIENT_RETRY_ATTEMPTS` = 3, `DATABASE_LOCK_TIMEOUT_MS` = 5000, backoff ≤ 50 + 100 ms):
-  - sem a corrida de idempotência: 3 × 5 s + 0,15 s ≈ **15,2 s**;
-  - com o reinício por 23505: até 2 esperas de lock que falham, mais 1 tentativa que pega o lock e leva
-    o 23505, mais um segundo ciclo de 3 × 5 s ≈ **25,3 s**.
-
-  O `VisibilityTimeout` atual é 30 s: a margem é de ~5 s. A regra para a Fase 5, validada no boot do
-  consumidor, é:
-
-  ```
-  VisibilityTimeout > (2 × tentativas − 1) × lock_timeout + backoff + execução + margem
-  ```
-
-  Recomendação: subir o VisibilityTimeout para 60 s (ou estender a visibilidade durante o
-  processamento).
+- **VisibilityTimeout × pior caso de processamento:** resolvido na Fase 5 (60 s, validado no boot do
+  consumidor). Ver seção 12.
 
 ## 11. API HTTP
 
@@ -981,3 +967,173 @@ erro, e entra no `RequestContext` do use case, que o grava nos eventos da outbox
   o `FOR UPDATE` da wallet, uma segunda instância da API com `lock_timeout` de 100 ms esgota as 3
   tentativas (`55P03`) e responde 503 com `Retry-After`; depois do lock solto, o reenvio da mesma
   requisição é processado uma única vez.
+
+## 12. Consumidor SQS
+
+`src/infrastructure/messaging` consome `wager-transactions.fifo` e, como a API, é só um adaptador:
+valida a forma, chama o **mesmo** `ProcessWagerTransaction` (com a inbox na mesma transação SQL) e
+traduz o resultado em uma ação sobre a mensagem. O processo `sqs-consumer` roda com 2 réplicas no
+compose.
+
+### Loop
+
+- Long polling (`ReceiveMessage`, `WaitTimeSeconds` = 5 s, ver "SIGTERM") e
+  `SQS_CONSUMER_CONCURRENCY` (4) mensagens em andamento por processo. Só busca quando há vaga.
+- **Ordem dentro do lote FIFO.** O SQS pode devolver várias mensagens do mesmo `MessageGroupId`
+  (walletId) num lote. Elas rodam em sequência; grupos diferentes rodam em paralelo. Se uma mensagem
+  do grupo vai para retry, as seguintes do mesmo lote não são processadas e recebem a mesma
+  visibilidade, para não passarem na frente. A correção não depende disso (depende do lock da
+  wallet); a ordem só evita PENDING_REFERENCE desnecessário.
+- `consumerName` fixo (`wager-transactions-consumer`), igual em todas as réplicas. Um nome por
+  instância daria uma inbox por réplica, e nada seria deduplicado entre elas.
+
+### Envelope
+
+- `zod` estrito em todos os níveis: `messageId` (texto), `type` = `WagerTransactionRequested`,
+  `occurredAt` (ISO 8601) e `data` = **o mesmo schema do corpo HTTP** + `idempotencyKey`. Os schemas
+  de forma ficam em `src/infrastructure/validation/wager-schemas.ts`, usados pelos dois adaptadores.
+- As regras semânticas continuam no domínio (`INVALID_AMOUNT`, `KIND_NOT_ALLOWED`…), como no HTTP.
+- **Chave da inbox = `messageId` do envelope**, não o `MessageId` do SQS. O do envelope é a identidade
+  do produtor e não muda quando ele reenvia a mesma mensagem; o do SQS é novo a cada envio, e a inbox
+  não deduplicaria nada.
+- `correlationId`: atributo de mensagem `correlationId` (mesma regra do header HTTP); senão o
+  `messageId`. O `messageId` vira o `causationId` dos eventos.
+
+### Resultado → ação
+
+Função pura `decideForError` / `decideForResult` (`delivery-decision.ts`), pela **categoria** do
+catálogo de códigos, como o `mapError` do HTTP.
+
+| Resultado                                                                                           | Ação                                                     |
+| --------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| PROCESSED, REJECTED, PENDING_REFERENCE, FAILED (replay)                                             | ack                                                      |
+| `WALLET_NOT_FOUND` (seção 8), `IDEMPOTENCY_KEY_REUSED`, `EXTERNAL_TRANSACTION_ID_CONFLICT`          | ack + log `warn` + métrica (repetir dá a mesma resposta) |
+| `TransientFailureError` (lock timeout, deadlock, conexão), depois do retry interno de 3 tentativas  | retry: `ChangeMessageVisibility` com backoff             |
+| JSON inválido, envelope inválido, `ValidationError` do domínio, mensagem envenenada                 | DLQ **explícita**, na hora                               |
+| `PersistenceIntegrityError`, `StaleWalletVersionError`, invariante violada, erro desconhecido (bug) | retry com backoff → DLQ **pelo redrive**                 |
+
+- **Backoff do retry:** por `ApproximateReceiveCount`, exponencial com jitter (~2 s, ~4 s, ~8 s…, teto
+  60 s), em segundos inteiros. O contador fica no SQS: sobrevive a crash e a troca de instância.
+- **Dois caminhos para a DLQ, de propósito:**
+  - **Envio explícito** para o que é certo que nunca vai dar certo (forma inválida, envenenada).
+    Esperar o redrive gastaria `maxReceiveCount` × backoff e **seguraria o grupo FIFO da wallet**
+    esse tempo todo. A cópia na DLQ leva o corpo original, o `MessageGroupId` original e os atributos
+    `failureCode`, `reason`, `consumer`, `sourceMessageId` e `receiveCount`. Depois vem o
+    `DeleteMessage`.
+  - **Redrive por `maxReceiveCount`** (broker) para transitórios esgotados e bugs. Um erro
+    desconhecido não é provadamente permanente (pode ser ambiental), e poucas tentativas custam pouco.
+    Não há lógica nossa de "última tentativa".
+- **`MessageDeduplicationId` do envio à DLQ = `MessageId` do SQS** da mensagem recebida. Ele é estável
+  entre redeliveries da mesma mensagem: se o processo morrer entre o envio à DLQ e o delete, a
+  redelivery reenvia e a dedup FIFO (5 min) descarta a cópia. E é único por envio: duas mensagens
+  envenenadas que reutilizam o mesmo `messageId` do envelope ficam **as duas** na DLQ para auditoria.
+  Mensagem com JSON inválido nem tem envelope de onde ler um id. Se o envio à DLQ falhar, a mensagem
+  não é apagada: a visibilidade expira e ela é decidida de novo.
+- **Boot:** o consumidor lê a fila (`GetQueueAttributes`) e não sobe sem `RedrivePolicy` apontando
+  para a DLQ configurada.
+
+### Ack só depois do commit
+
+`DeleteMessage` só roda depois de o use case retornar, ou seja, depois do COMMIT. Se o processo
+morrer entre o commit e o delete, a visibilidade expira e outra instância recebe a mensagem. A inbox
+`(consumerName, messageId)` já existe com o mesmo hash, o fluxo segue para a idempotência, encontra a
+transação e devolve **replay**. Ack, sem lançamento, evento ou saldo duplicado. O mesmo vale para um
+COMMIT ambíguo. Falha no delete (receipt expirado, rede) só gera log e métrica, pelo mesmo motivo.
+
+### VisibilityTimeout: 60 s, validado no boot
+
+A mensagem precisa ficar invisível enquanto é processada; senão outra instância a recebe no meio.
+Isso não duplica efeito (lock + inbox + idempotência), mas gasta tentativas. O consumidor calcula o
+pior caso a partir da config e **não sobe** se a fila não o cobrir:
+
+```
+VisibilityTimeout > (2 × tentativas − 1) × lock_timeout + 2 × Σ backoff máximo + SQS_PROCESSING_MARGIN_MS
+```
+
+O fator 2 vem do único reinício por corrida de idempotência (seção 10). Com os padrões: 5 × 5 s +
+2 × (50 + 100) ms + 10 s = **35,3 s < 60 s**. O VisibilityTimeout subiu de 30 s para 60 s no script de
+init, nos composes e nas filas de teste.
+
+**Sem extensão de visibilidade (heartbeat).** O pior caso é limitado e calculado; um heartbeat
+acrescenta timers e estado por mensagem e pode esconder um processamento travado. Se mesmo assim o
+tempo estourar (um statement lento além do previsto), a consequência é uma entrega concorrente, que é
+segura e custa uma tentativa.
+
+### Banco fora do ar não gasta tentativas (`DatabaseGate`)
+
+Cada receive conta para o `maxReceiveCount`. Se o consumidor continuasse buscando com o PostgreSQL
+fora do ar, mensagens válidas iriam para a DLQ só por causa da queda. O desafio pede o contrário:
+"PostgreSQL e SQS podem ficar temporariamente indisponíveis".
+
+- O gate **fecha** quando um `TransientFailureError` tem causa de conexão (classe `08`, `57P01`,
+  `57P03`, `ECONNREFUSED`/`ECONNRESET`/…), ou quando a sonda `select 1` falha ou passa do timeout
+  (`SQS_DATABASE_PROBE_TIMEOUT_MS`). O timeout é necessário porque um servidor congelado ou
+  particionado não recusa a conexão: ele simplesmente não responde.
+- Antes de cada `ReceiveMessage`, o loop pede passagem ao gate. Aberto e com verificação recente (
+  `SQS_DATABASE_PROBE_FRESHNESS_MS`; uma mensagem processada também conta), passa direto. Senão,
+  sonda; enquanto falhar, espera com backoff (1 s → 30 s) e **não busca**, sem limite de tempo:
+  esperar não custa receives. Só uma sonda por vez, para não empilhar conexões penduradas no pool.
+- Mensagens que já estavam em andamento seguem a regra normal de retry.
+
+**Tolerância resultante:** uma queda do banco, de qualquer duração, consome no máximo uma receive por
+réplica do consumidor de cada mensagem que estava em andamento ou chegou no último poll antes de a
+réplica perceber a queda. Mensagens que chegam depois ficam na fila, intocadas, até o banco voltar.
+
+**`maxReceiveCount` continua 5.** Com o gate, o que consome receives são falhas reais por mensagem
+(lock disputado além de 3 × `lock_timeout`, bugs), não a disponibilidade do banco. Subir o limite
+seguraria o grupo FIFO da wallet por mais tempo em caso de bug (com 10, ~5 min de backoff acumulado
+contra ~30 s com 5). Regra para quem operar: `maxReceiveCount` ≥ réplicas do consumidor + 3; com 2
+réplicas, 5 basta.
+
+### SIGTERM
+
+`stop()` para de buscar, espera até `SQS_SHUTDOWN_DRAIN_MS` (8 s) as mensagens em andamento e devolve
+a visibilidade (`ChangeMessageVisibility` = 0) das que não terminaram, inclusive as que estavam
+esperando a vez no grupo. Outra instância as recebe na hora, sem esperar os 60 s.
+
+- **O long poll em andamento não é abortado.** Um `AbortSignal` no `ReceiveMessage` corta só o lado do
+  cliente: na LocalStack (reproduzido em teste), a requisição continua aberta no servidor até o
+  `WaitTimeSeconds` e **pega a próxima mensagem visível**, justamente a que acabamos de liberar,
+  escondendo-a por um VisibilityTimeout inteiro numa conexão que ninguém lê. Por isso o `stop()`
+  espera o último poll voltar (≤ `WaitTimeSeconds`, daí os 5 s em vez de 20 s), libera o que ele
+  trouxe e só então libera as mensagens que não terminaram. O `AbortSignal` continua interrompendo a
+  espera do gate e as pausas entre polls.
+- É seguro mesmo com a transação ainda aberta: outra instância recebe, espera o lock da wallet e, se o
+  nosso commit passar, faz replay; se o processo sair antes, a conexão cai e o PostgreSQL faz rollback.
+- O prazo do desligamento do processo é `max(drain, WaitTimeSeconds) + 4 s` (12 s com os padrões),
+  dentro do `stop_grace_period` de 15 s.
+
+### Testes
+
+- **Unitários:** tabela inteira de `decideForError`/`decideForResult`, envelope (válido, JSON
+  quebrado, tipo errado, campo extra, `"25"` passando para o domínio), orçamento de visibilidade
+  (inclusive "exatamente o pior caso não basta") e `DatabaseGate` (frescor, sonda pendurada não
+  duplicada, abort).
+- **Integração** (`test/integration/messaging/`, consumidor real em processo, filas isoladas):
+  BET ponta a ponta (ledger, inbox, outbox, fila vazia); a mesma mensagem enviada 2× → um efeito;
+  REJECTED, PENDING_REFERENCE, WALLET_NOT_FOUND e conflito → ack; malformadas → DLQ com
+  `receiveCount` 1; envenenadas → DLQ, as duas mantidas; retry com backoff pela barreira de lock
+  (`receiveCount` 1, 2…, motivo `55P03`) e depois processada uma vez; DLQ pelo redrive com
+  `maxReceiveCount` 2; `stop()` devolvendo a visibilidade; boot recusando VT curto e redrive errado.
+- **Queda do banco** (`database-outage.spec.ts`): `docker pause` no PostgreSQL de teste → o gate fecha,
+  a mensagem fica na fila sem ser recebida por várias rodadas de sonda; `docker unpause` → processada
+  uma vez com `receiveCount` 1, sem DLQ.
+- **Processos** (`test/concurrency/messaging/`, `Bun.spawn`):
+  - **morto entre o commit e o ack:** um entrypoint só de teste monta o consumidor real com um cliente
+    SQS cujo `DeleteMessage` avisa no stdout e nunca termina; o teste confirma o commit e dá
+    `SIGKILL`. Outro processo recebe a redelivery (`receiveCount` 2) e responde replay: um lançamento,
+    eventos uma vez. Nada no código de produção sabe desse teste.
+  - **SIGTERM com mensagem presa no lock:** o processo sai com 0, a mensagem volta visível na hora e o
+    próximo processo a aplica uma vez.
+  - **3 processos** na mesma fila, 6 wallets × 8 BETs, cada mensagem enviada 2×: cada BET aplicada uma
+    vez, saldos e ledger corretos.
+
+Todos terminam com `assertLedgerInvariant`.
+
+### Limitações e próximos passos
+
+- Métricas do consumidor em memória por processo até a Fase 7 (Prometheus).
+- `WaitTimeSeconds` de 5 s faz mais polls vazios que 20 s (12 por minuto por processo, ocioso). É o
+  preço de um desligamento rápido sem abortar o poll.
+- Mensagens que o SQS entregar numa receive cuja conexão caiu (rede, não SIGTERM) só voltam depois do
+  VisibilityTimeout. É atraso, não perda.

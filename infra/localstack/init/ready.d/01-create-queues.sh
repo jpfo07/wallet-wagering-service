@@ -7,7 +7,7 @@ WAGER_QUEUE="${SQS_WAGER_QUEUE_NAME:-wager-transactions.fifo}"
 WAGER_DLQ="${SQS_WAGER_DLQ_NAME:-wager-transactions-dlq.fifo}"
 EVENTS_QUEUE="${SQS_EVENTS_QUEUE_NAME:-wallet-events.fifo}"
 MAX_RECEIVE_COUNT="${SQS_MAX_RECEIVE_COUNT:-5}"
-VISIBILITY_TIMEOUT="${SQS_VISIBILITY_TIMEOUT_SECONDS:-30}"
+VISIBILITY_TIMEOUT="${SQS_VISIBILITY_TIMEOUT_SECONDS:-60}"
 
 # Deduplicação sempre explícita (MessageDeduplicationId = messageId/eventId), nunca por conteúdo.
 FIFO_ATTRS='"FifoQueue":"true","ContentBasedDeduplication":"false"'

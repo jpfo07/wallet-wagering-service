@@ -1,4 +1,6 @@
 import type { ApplicationMetrics, LogFields, Logger } from "../../application/ports/telemetry.ts";
+import type { DeliveryDecision } from "../messaging/delivery-decision.ts";
+import type { ConsumerMetrics } from "../messaging/wager-queue-consumer.ts";
 
 type Level = "info" | "warn" | "error";
 
@@ -69,5 +71,35 @@ export class InMemoryApplicationMetrics implements ApplicationMetrics {
 
   private increment(key: string): void {
     this.counters.set(key, (this.counters.get(key) ?? 0) + 1);
+  }
+}
+
+/** Process-local counters of the SQS consumer (Prometheus in the observability phase). */
+export class InMemoryConsumerMetrics implements ConsumerMetrics {
+  private readonly counters = new Map<string, number>();
+
+  received(count: number): void {
+    this.increment("sqs_received", count);
+  }
+
+  handled(action: DeliveryDecision["action"], outcome: string): void {
+    this.increment(`sqs_handled{action=${action},outcome=${outcome}}`);
+    this.increment(`sqs_handled{action=${action}}`);
+  }
+
+  deleteFailed(): void {
+    this.increment("sqs_delete_failed");
+  }
+
+  released(count: number): void {
+    this.increment("sqs_released", count);
+  }
+
+  count(name: string): number {
+    return this.counters.get(name) ?? 0;
+  }
+
+  private increment(key: string, by = 1): void {
+    this.counters.set(key, (this.counters.get(key) ?? 0) + by);
   }
 }

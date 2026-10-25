@@ -35,6 +35,29 @@ export interface PendingReferenceConfig {
   readonly ttlMs: number;
 }
 
+/** SQS consumer of wager-transactions.fifo (see ARCHITECTURE.md, section 12). */
+export interface SqsConsumerConfig {
+  /** Messages in flight per process. */
+  readonly concurrency: number;
+  /**
+   * Long polling wait (0 to 20 s). Short on purpose: SIGTERM waits for the poll in progress
+   * instead of aborting it (an aborted poll stays open on the server and steals messages).
+   */
+  readonly waitTimeSeconds: number;
+  /** Visibility backoff of a retried message, by ApproximateReceiveCount. */
+  readonly retryBaseMs: number;
+  readonly retryMaxMs: number;
+  /** How long SIGTERM waits for in-flight messages before giving their visibility back. */
+  readonly shutdownDrainMs: number;
+  /** Margin over the computed worst case that the queue VisibilityTimeout must also cover. */
+  readonly processingMarginMs: number;
+  /** Database gate: probe timeout, how long a healthy check stays fresh, pause backoff. */
+  readonly databaseProbeTimeoutMs: number;
+  readonly databaseProbeFreshnessMs: number;
+  readonly databasePauseBaseMs: number;
+  readonly databasePauseMaxMs: number;
+}
+
 export interface AppConfig {
   readonly instanceId: string;
   readonly httpPort: number;
@@ -46,6 +69,7 @@ export interface AppConfig {
   readonly sqs: SqsConfig;
   readonly transientRetry: TransientRetryConfig;
   readonly pendingReference: PendingReferenceConfig;
+  readonly sqsConsumer: SqsConsumerConfig;
 }
 
 export class ConfigError extends Error {
@@ -71,6 +95,18 @@ function int(source: Source, key: string, fallback?: number): number {
     throw new ConfigError(`Variável ${key} deve ser um inteiro não negativo, recebido "${raw}"`);
   }
   return Number(raw);
+}
+
+function atLeastOne(source: Source, key: string, fallback: number): number {
+  const value = int(source, key, fallback);
+  if (value < 1) throw new ConfigError(`Variável ${key} deve ser maior que zero`);
+  return value;
+}
+
+function atMost(source: Source, key: string, fallback: number, max: number): number {
+  const value = int(source, key, fallback);
+  if (value > max) throw new ConfigError(`Variável ${key} deve ser no máximo ${max}`);
+  return value;
 }
 
 export function loadConfig(source: Source = process.env): AppConfig {
@@ -106,6 +142,18 @@ export function loadConfig(source: Source = process.env): AppConfig {
       baseMs: int(source, "PENDING_REFERENCE_BACKOFF_BASE_MS", 1_000),
       maxMs: int(source, "PENDING_REFERENCE_BACKOFF_MAX_MS", 60_000),
       ttlMs: int(source, "PENDING_REFERENCE_TTL_MS", 900_000),
+    },
+    sqsConsumer: {
+      concurrency: atLeastOne(source, "SQS_CONSUMER_CONCURRENCY", 4),
+      waitTimeSeconds: atMost(source, "SQS_WAIT_TIME_SECONDS", 5, 20),
+      retryBaseMs: atLeastOne(source, "SQS_RETRY_BACKOFF_BASE_MS", 2_000),
+      retryMaxMs: atLeastOne(source, "SQS_RETRY_BACKOFF_MAX_MS", 60_000),
+      shutdownDrainMs: int(source, "SQS_SHUTDOWN_DRAIN_MS", 8_000),
+      processingMarginMs: int(source, "SQS_PROCESSING_MARGIN_MS", 10_000),
+      databaseProbeTimeoutMs: atLeastOne(source, "SQS_DATABASE_PROBE_TIMEOUT_MS", 2_000),
+      databaseProbeFreshnessMs: int(source, "SQS_DATABASE_PROBE_FRESHNESS_MS", 2_000),
+      databasePauseBaseMs: atLeastOne(source, "SQS_DATABASE_PAUSE_BASE_MS", 1_000),
+      databasePauseMaxMs: atLeastOne(source, "SQS_DATABASE_PAUSE_MAX_MS", 30_000),
     },
   };
 }

@@ -13,7 +13,12 @@ import { configureApiApp } from "../../src/infrastructure/http/create-api-app.ts
 import { SilentLogger } from "../../src/infrastructure/observability/telemetry-adapters.ts";
 import { createIsolatedDatabase, openSql } from "./database.ts";
 import type { IsolatedDatabase } from "./database.ts";
-import { TEST_PENDING_REFERENCE, TEST_TRANSIENT_RETRY, testSqsConfig } from "./test-env.ts";
+import {
+  TEST_PENDING_REFERENCE,
+  TEST_SQS_CONSUMER,
+  TEST_TRANSIENT_RETRY,
+  testSqsConfig,
+} from "./test-env.ts";
 
 export interface ApiHandle {
   readonly baseUrl: string;
@@ -62,6 +67,7 @@ export function useApiSuite(name: string): () => ApiSuite {
       sqs: testSqsConfig(),
       transientRetry: TEST_TRANSIENT_RETRY,
       pendingReference: TEST_PENDING_REFERENCE,
+      sqsConsumer: TEST_SQS_CONSUMER,
     };
     const moduleRef = await Test.createTestingModule({ imports: [ApiModule] })
       .overrideProvider(APP_CONFIG)

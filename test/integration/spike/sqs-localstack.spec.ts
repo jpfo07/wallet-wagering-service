@@ -92,7 +92,7 @@ describe("spike C — SQS on LocalStack 4.14.0", () => {
     const main = await attributes(url("wager-transactions.fifo"));
     expect(main["FifoQueue"]).toBe("true");
     expect(main["ContentBasedDeduplication"]).toBe("false");
-    expect(main["VisibilityTimeout"]).toBe("30");
+    expect(main["VisibilityTimeout"]).toBe("60");
     const redrive = JSON.parse(main["RedrivePolicy"] ?? "{}") as Record<string, unknown>;
     expect(String(redrive["deadLetterTargetArn"])).toEndWith(":wager-transactions-dlq.fifo");
     expect(String(redrive["maxReceiveCount"])).toBe("5");

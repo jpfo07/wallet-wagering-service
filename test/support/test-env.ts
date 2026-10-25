@@ -2,6 +2,7 @@ import type {
   DatabaseConfig,
   PendingReferenceConfig,
   SqsConfig,
+  SqsConsumerConfig,
   TransientRetryConfig,
 } from "../../src/infrastructure/config/env.ts";
 
@@ -11,6 +12,20 @@ export const TEST_PENDING_REFERENCE: PendingReferenceConfig = {
   baseMs: 1_000,
   maxMs: 60_000,
   ttlMs: 900_000,
+};
+
+/** Consumer settings for tests: short polls, drain and backoffs, so nothing waits for seconds. */
+export const TEST_SQS_CONSUMER: SqsConsumerConfig = {
+  concurrency: 4,
+  waitTimeSeconds: 1,
+  retryBaseMs: 1_000,
+  retryMaxMs: 2_000,
+  shutdownDrainMs: 2_000,
+  processingMarginMs: 10_000,
+  databaseProbeTimeoutMs: 500,
+  databaseProbeFreshnessMs: 500,
+  databasePauseBaseMs: 100,
+  databasePauseMaxMs: 500,
 };
 
 /** Connection data of the test stack (docker-compose.test.yml). Never reads DATABASE_* vars. */

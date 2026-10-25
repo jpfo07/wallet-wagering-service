@@ -42,6 +42,7 @@ services:
       LOCALSTACK_HOST: localstack:4566
       AWS_DEFAULT_REGION: us-east-1
       SQS_MAX_RECEIVE_COUNT: "5"
+      SQS_VISIBILITY_TIMEOUT_SECONDS: "60"
     volumes:
       - ./infra/localstack/init/ready.d:/etc/localstack/init/ready.d:ro
     ports:

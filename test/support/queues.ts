@@ -47,7 +47,7 @@ async function createQueue(
  */
 export async function createIsolatedQueues(
   suite: string,
-  { maxReceiveCount = 5, visibilityTimeoutSeconds = 30 }: IsolatedQueuesOptions = {},
+  { maxReceiveCount = 5, visibilityTimeoutSeconds = 60 }: IsolatedQueuesOptions = {},
 ): Promise<IsolatedQueues> {
   const slug = suite
     .toLowerCase()
