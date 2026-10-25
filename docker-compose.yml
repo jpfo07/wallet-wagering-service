@@ -36,6 +36,8 @@ x-app-env: &app-env
   PENDING_REFERENCE_BATCH_SIZE: "50"
   PENDING_REFERENCE_POLL_INTERVAL_MS: "500"
   HTTP_PORT: "3000"
+  # > keepalive_timeout do upstream no nginx (2s): ver infra/nginx/nginx.conf.
+  HTTP_SHUTDOWN_DRAIN_MS: "2500"
   WORKER_HEALTH_PORT: "9100"
 
 # Uma única imagem para todos os processos; cada serviço escolhe o comando.

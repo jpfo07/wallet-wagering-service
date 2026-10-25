@@ -52,6 +52,7 @@ describe("spike A — NestJS on Bun", () => {
         instanceId: "spike-instance",
         httpPort: 0,
         httpRetryAfterSeconds: 1,
+        httpShutdownDrainMs: 0,
         workerHealthPort: 0,
         database: db.config,
         sqs: testSqsConfig(),

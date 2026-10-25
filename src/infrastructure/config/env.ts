@@ -94,6 +94,12 @@ export interface AppConfig {
   readonly httpPort: number;
   /** Retry-After (seconds) of a 503 caused by a transient infrastructure failure. */
   readonly httpRetryAfterSeconds: number;
+  /**
+   * On SIGTERM, how long an API replica keeps answering (with `Connection: close`, readiness 503)
+   * before closing its port: longer than the proxy's upstream keepalive timeout, so every pooled
+   * socket to this replica is gone before it closes. 0 outside a proxied deployment.
+   */
+  readonly httpShutdownDrainMs: number;
   /** Internal health port of worker processes. */
   readonly workerHealthPort: number;
   readonly database: DatabaseConfig;
@@ -148,6 +154,7 @@ export function loadConfig(source: Source = process.env): AppConfig {
     instanceId: str(source, "INSTANCE_ID", hostname()),
     httpPort: int(source, "HTTP_PORT", 3000),
     httpRetryAfterSeconds: int(source, "HTTP_RETRY_AFTER_SECONDS", 1),
+    httpShutdownDrainMs: int(source, "HTTP_SHUTDOWN_DRAIN_MS", 0),
     workerHealthPort: int(source, "WORKER_HEALTH_PORT", 9100),
     database: {
       host: str(source, "DATABASE_HOST"),

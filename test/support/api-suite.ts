@@ -79,6 +79,7 @@ export function useApiSuite(name: string, options: ApiSuiteOptions = {}): () => 
       instanceId: `api-test-${apps.length + 1}`,
       httpPort: 0,
       httpRetryAfterSeconds: RETRY_AFTER_SECONDS,
+      httpShutdownDrainMs: 0,
       workerHealthPort: 0,
       database: { ...db.config, ...database },
       sqs: testSqsConfig(),

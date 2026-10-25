@@ -3,7 +3,10 @@
 #   1. sobe tudo com --wait (healthchecks) e confere que as migrations saíram com 0;
 #   2. confere réplicas e saúde de cada serviço;
 #   3. 30 requisições pelo nginx precisam alcançar 3 instâncias distintas da API;
-#   4. failover: derruba uma réplica, o nginx continua respondendo pelas outras; depois ela volta;
+#   4. failover: derruba uma réplica, o nginx continua respondendo pelas outras; depois ela volta.
+#      Da subida ao fim do failover, NENHUMA requisição pode falhar: as do script e as de um prober em
+#      segundo plano (GET e um POST de leitura) são todas exigidas 2xx. A única espera é a do pool do
+#      nginx convergir (DNS), e cada requisição dessa espera também precisa dar 2xx;
 #   5. SIGTERM durante o boot de um worker: para em poucos segundos com 0 ou 143, nunca 137 (SIGKILL);
 #   6. desligamento: `docker compose stop` com a stack saudável, todos os containers saem com 0.
 # Uso: scripts/compose-smoke.sh [--down]   (no fim a stack fica parada; --down também a remove com os
@@ -22,6 +25,7 @@ fail() {
 
 on_exit() {
   local rc=$?
+  [[ -n "${PROBE_STOP:-}" ]] && touch "$PROBE_STOP"
   if [[ $rc -ne 0 ]]; then
     echo "--- docker compose ps -a" >&2
     docker compose ps -a >&2 || true
@@ -44,12 +48,50 @@ wait_until() {
   done
 }
 
+# Toda resposta não-2xx de qualquer requisição do smoke vai para cá; uma única linha reprova.
+ERRORS=$(mktemp)
+PROBE_STOP=$(mktemp -u)
+
+# X-Instance-Id de n GETs. Uma resposta não-2xx é registrada (e reprova), nunca descartada.
 instance_ids() {
-  local n="$1"
+  local n="$1" headers status
   for _ in $(seq "$n"); do
-    curl -fsS -D - -o /dev/null "$BASE_URL/health/live" | tr -d '\r' | awk -F': ' 'tolower($1) == "x-instance-id" { print $2 }'
+    headers=$(curl -sS -D - -o /dev/null --max-time 10 "$BASE_URL/health/live" | tr -d '\r') || true
+    status=$(awk 'NR == 1 { print $2 }' <<<"$headers")
+    if [[ "$status" != 2* ]]; then
+      echo "$(date +%T.%3N) GET /health/live -> ${status:-sem resposta}" >>"$ERRORS"
+      continue
+    fi
+    awk -F': ' 'tolower($1) == "x-instance-id" { print $2 }' <<<"$headers"
   done
 }
+
+assert_no_errors() {
+  [[ ! -s "$ERRORS" ]] || fail "$1: requisições sem 2xx:"$'\n'"$(head -20 "$ERRORS")"
+}
+
+# Tráfego contínuo em segundo plano: GET e um POST de leitura (reconciliação), que o nginx não pode
+# reenviar depois de enviado. Prova que nenhuma requisição se perde enquanto réplicas param e voltam.
+start_prober() {
+  local wallet="$1"
+  rm -f "$PROBE_STOP"
+  (
+    while [[ ! -e "$PROBE_STOP" ]]; do
+      for request in "GET /health/live" "POST /wallets/$wallet/reconciliation"; do
+        status=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -X "${request%% *}" "$BASE_URL${request#* }") || true
+        [[ "$status" == 2* ]] || echo "$(date +%T.%3N) $request -> ${status:-sem resposta}" >>"$ERRORS"
+      done
+    done
+  ) &
+  PROBER_PID=$!
+}
+
+stop_prober() {
+  touch "$PROBE_STOP"
+  wait "$PROBER_PID" 2>/dev/null || true
+}
+
+three_instances() { [[ "$(instance_ids 30 | sort -u | grep -c .)" == "3" ]]; }
 
 echo "==> subindo a stack"
 docker compose up -d --build --wait --wait-timeout 240
@@ -68,16 +110,24 @@ for service in "${!expected[@]}"; do
 done
 
 echo "==> balanceamento pelo nginx"
+# O pool do nginx segue o DNS (valid=1s): logo depois de um "up" que recriou as APIs ele pode ainda
+# não ter os 3 IPs. Espera a convergência; cada requisição dela continua obrigada a dar 2xx.
+wait_until 15 "nginx enxergar as 3 réplicas" three_instances
 ids=$(instance_ids 30)
 distinct=$(sort -u <<<"$ids" | grep -c . || true)
 [[ "$distinct" == "3" ]] || fail "esperava 3 X-Instance-Id distintos em 30 requisições, vieram $distinct: $(sort -u <<<"$ids" | paste -sd' ')"
+assert_no_errors "balanceamento"
 echo "ok: 30 requisições atendidas por 3 instâncias ($(sort <<<"$ids" | uniq -c | awk '{ printf "%s=%s ", $2, $1 }'))"
 
 ready=$(curl -fsS "$BASE_URL/health/ready")
 [[ "$ready" == *'"postgres":"up"'* && "$ready" == *'"sqs":"up"'* ]] || fail "readiness inesperado: $ready"
 echo "ok: /health/ready pelo nginx: $ready"
 
-echo "==> failover: derrubando uma réplica da API"
+echo "==> failover: derrubando uma réplica da API (com tráfego GET e POST em segundo plano)"
+wallet=$(curl -fsS -X POST "$BASE_URL/wallets" -H 'content-type: application/json' \
+  -d "{\"playerId\":\"$(cat /proc/sys/kernel/random/uuid)\",\"initialBalance\":{\"amount\":\"10.00\",\"currency\":\"BRL\"}}" |
+  sed -E 's/.*"id":"([^"]+)".*/\1/')
+start_prober "$wallet"
 victim=$(docker compose ps -q api | head -1)
 victim_id=$(docker inspect --format '{{.Config.Hostname}}' "$victim")
 docker stop "$victim" >/dev/null
@@ -90,9 +140,12 @@ echo "ok: 20/20 requisições com sucesso pelas 2 réplicas restantes"
 docker start "$victim" >/dev/null
 is_healthy() { [[ "$(docker inspect --format '{{.State.Health.Status}}' "$victim")" == "healthy" ]]; }
 wait_until 60 "réplica $victim_id voltar a healthy" is_healthy
-three_again() { [[ "$(instance_ids 30 | sort -u | grep -c .)" == "3" ]]; }
-wait_until 30 "nginx voltar a balancear entre 3 instâncias" three_again
+wait_until 15 "nginx voltar a balancear entre 3 instâncias" three_instances
 echo "ok: réplica voltou e o nginx balanceia entre 3 instâncias de novo"
+stop_prober
+assert_no_errors "failover e reintegração"
+probes=$(docker compose logs --no-log-prefix nginx 2>/dev/null | grep -c '/reconciliation' || true)
+echo "ok: nenhuma requisição sem 2xx durante o failover (prober: ${probes} POSTs pelo nginx)"
 
 echo "==> SIGTERM durante o boot de um worker"
 worker=$(docker compose ps -q sqs-consumer | head -1)
@@ -119,14 +172,19 @@ bad=$(awk '$2 != "0"' <<<"$exits")
 total=$(grep -c . <<<"$exits")
 [[ "$total" == "13" ]] || fail "esperava 13 containers parados (12 serviços + migrations), vieram $total"
 # Prazo só para os nossos processos (param primeiro, por dependência); Postgres e LocalStack têm o
-# próprio grace period e só precisam sair com 0.
+# próprio grace period e só precisam sair com 0. O limite é o maior prazo de desligamento dos
+# processos (sqs-consumer: max(SQS_SHUTDOWN_DRAIN_MS, long poll) + 4s = 12s), abaixo do
+# stop_grace_period (15s): o consumer espera de propósito o último long poll (até 5s, mais a latência
+# do LocalStack com a stack inteira parando junto), então um limite menor reprovaria um desligamento
+# correto. Um travamento continua aparecendo: passa do prazo ou sai com 137 (SIGKILL).
+STOP_LIMIT_MS=12000
 slowest_ms=0
 for service in api sqs-consumer outbox-publisher pending-reference-worker nginx; do
   for container in $(docker compose ps -aq "$service"); do
     finished_ns=$(date -d "$(docker inspect --format '{{.State.FinishedAt}}' "$container")" +%s%N)
     took_ms=$(((finished_ns - started_ns) / 1000000))
     ((took_ms > slowest_ms)) && slowest_ms=$took_ms
-    ((took_ms < 8000)) || fail "$service ($container) levou ${took_ms}ms para parar (limite 8000ms)"
+    ((took_ms < STOP_LIMIT_MS)) || fail "$service ($container) levou ${took_ms}ms para parar (limite ${STOP_LIMIT_MS}ms)"
   done
 done
 echo "ok: $total containers com exit 0; aplicação parada em até ${slowest_ms}ms (stop total ${elapsed_ms}ms)"

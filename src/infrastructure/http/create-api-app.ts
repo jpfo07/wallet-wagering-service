@@ -8,6 +8,7 @@ import { ApiExceptionFilter } from "./api-exception.filter.ts";
 import { NestLoggerAdapter } from "../observability/nest-logger.adapter.ts";
 import { ApiModule } from "./api.module.ts";
 import { CORRELATION_ID_HEADER, resolveCorrelationId } from "./correlation-id.ts";
+import { HttpDrain } from "./http-drain.ts";
 import { LogContextInterceptor } from "./log-context.interceptor.ts";
 import type { HttpRequest, HttpResponse } from "./request-context.decorator.ts";
 
@@ -24,6 +25,7 @@ const UNLOGGED_PATHS = /^\/(health|metrics)(\/|$)/;
 export function configureApiApp(app: INestApplication): INestApplication {
   const config = app.get<AppConfig>(APP_CONFIG);
   const { logger, ids } = app.get<Application>(APPLICATION).dependencies;
+  const drain = app.get(HttpDrain);
   app.use((request: HttpRequest, response: HttpResponse, next: () => void) => {
     const correlationId = resolveCorrelationId(
       request.headers[CORRELATION_ID_HEADER.toLowerCase()],
@@ -31,6 +33,7 @@ export function configureApiApp(app: INestApplication): INestApplication {
     );
     request.correlationId = correlationId;
     response.setHeader("X-Instance-Id", config.instanceId);
+    if (drain.active) response.setHeader("Connection", "close");
     response.setHeader(CORRELATION_ID_HEADER, correlationId);
     // Path without the query string; never the body or the headers.
     const path = request.originalUrl.split("?")[0] ?? "";

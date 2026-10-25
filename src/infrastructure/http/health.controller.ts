@@ -7,6 +7,7 @@ import { SQS_CLIENT } from "../messaging/messaging.module.ts";
 import { checkReadiness } from "../observability/readiness.ts";
 import { DatabaseProbe } from "../persistence/database-probe.ts";
 import type { ReadinessReport } from "../observability/readiness.ts";
+import { HttpDrain } from "./http-drain.ts";
 import type { HttpResponse } from "./request-context.decorator.ts";
 
 /** Open by design (section 2): orchestrator and proxy probes carry no provider credentials. */
@@ -15,6 +16,7 @@ import type { HttpResponse } from "./request-context.decorator.ts";
 export class HealthController {
   constructor(
     private readonly database: DatabaseProbe,
+    private readonly drain: HttpDrain,
     @Inject(SQS_CLIENT) private readonly sqs: SQSClient,
     @Inject(APP_CONFIG) private readonly config: AppConfig,
   ) {}
@@ -32,7 +34,13 @@ export class HealthController {
   @Get("ready")
   async ready(
     @Res({ passthrough: true }) response: HttpResponse,
-  ): Promise<{ status: "ok" | "unavailable"; checks: ReadinessReport["checks"] }> {
+  ): Promise<
+    { status: "ok" | "unavailable"; checks: ReadinessReport["checks"] } | { status: "draining" }
+  > {
+    if (this.drain.active) {
+      response.status(503);
+      return { status: "draining" };
+    }
     const report = await checkReadiness({
       pingPostgres: () => this.database.ping(),
       sqs: this.sqs,

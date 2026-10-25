@@ -6,6 +6,7 @@ import { MessagingModule } from "../messaging/messaging.module.ts";
 import { ObservabilityModule } from "../observability/observability.module.ts";
 import { PersistenceModule } from "../persistence/persistence.module.ts";
 import { HealthController } from "./health.controller.ts";
+import { HttpDrain } from "./http-drain.ts";
 import { MetricsController } from "./metrics.controller.ts";
 import { WageringController } from "./wagering.controller.ts";
 import { WalletsController } from "./wallets.controller.ts";
@@ -20,5 +21,6 @@ import { WalletsController } from "./wallets.controller.ts";
     AuthModule,
   ],
   controllers: [HealthController, MetricsController, WalletsController, WageringController],
+  providers: [HttpDrain],
 })
 export class ApiModule {}
