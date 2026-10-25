@@ -38,7 +38,8 @@
     "decimal.js": "10.6.0",
     "reflect-metadata": "0.2.2",
     "rxjs": "7.8.2",
-    "tinyglobby": "0.2.17"
+    "tinyglobby": "0.2.17",
+    "zod": "4.6.7"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",

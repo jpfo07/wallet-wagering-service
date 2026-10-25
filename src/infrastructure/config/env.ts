@@ -38,6 +38,8 @@ export interface PendingReferenceConfig {
 export interface AppConfig {
   readonly instanceId: string;
   readonly httpPort: number;
+  /** Retry-After (seconds) of a 503 caused by a transient infrastructure failure. */
+  readonly httpRetryAfterSeconds: number;
   /** Internal health port of worker processes. */
   readonly workerHealthPort: number;
   readonly database: DatabaseConfig;
@@ -76,6 +78,7 @@ export function loadConfig(source: Source = process.env): AppConfig {
   return {
     instanceId: str(source, "INSTANCE_ID", hostname()),
     httpPort: int(source, "HTTP_PORT", 3000),
+    httpRetryAfterSeconds: int(source, "HTTP_RETRY_AFTER_SECONDS", 1),
     workerHealthPort: int(source, "WORKER_HEALTH_PORT", 9100),
     database: {
       host: str(source, "DATABASE_HOST"),

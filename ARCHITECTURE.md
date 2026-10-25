@@ -839,8 +839,8 @@ quem não quer a OPENING filtra pelo `kind`. Com saldo zero não há evento.
 - **Replay de FAILED** não traz `balance` (FAILED não guarda saldo observado).
 - **`correlationId` e `causationId`** (o `messageId` no SQS) entram no comando e vão para os eventos;
   a propagação ponta a ponta é da Fase 7.
-- **UUIDs só em minúsculas** na entrada: o Postgres devolve minúsculas, e um `playerId` em maiúsculas
-  geraria outro hash e um falso `WALLET_PLAYER_MISMATCH`.
+- **UUIDs normalizados para minúsculas** na entrada (revisto na Fase 4; antes eram recusados). Ver
+  seção 11.
 
 ### Testes
 
@@ -874,3 +874,110 @@ quem não quer a OPENING filtra pelo `kind`. Com saldo zero não há evento.
 
   Recomendação: subir o VisibilityTimeout para 60 s (ou estender a visibilidade durante o
   processamento).
+
+## 11. API HTTP
+
+`src/infrastructure/http` é só um adaptador: valida a **forma** da requisição, chama o mesmo use case
+que o consumidor SQS vai usar e traduz o resultado em status HTTP. Nenhuma regra de negócio nova mora
+aqui.
+
+### Endpoints
+
+| Método e rota                                                             | Use case                     | Sucesso                                           |
+| ------------------------------------------------------------------------- | ---------------------------- | ------------------------------------------------- |
+| `POST /wallets`                                                           | `CreateWallet`               | 201 `{ id, playerId, balance, version }`          |
+| `GET /wallets/:walletId`                                                  | `GetWallet`                  | 200                                               |
+| `GET /wallets/:walletId/ledger?cursor=&limit=`                            | `GetLedgerPage`              | 200 `{ entries, nextCursor? }`                    |
+| `POST /wallets/:walletId/reconciliation`                                  | `ReconcileWallet`            | 200 (divergência = `consistent: false`, não erro) |
+| `POST /wagering/transactions` (header `Idempotency-Key`)                  | `ProcessWagerTransaction`    | 200 / 202 / 422, conforme o status da transação   |
+| `GET /wagering/transactions/:transactionId`                               | `GetTransaction`             | 200 (inclusive de uma transação REJECTED)         |
+| `GET /providers/:providerId/wagering/transactions/:externalTransactionId` | `GetTransactionByExternalId` | 200                                               |
+| `GET /health/live`, `GET /health/ready`                                   | —                            | 200 / 503 com `{ status, checks }`                |
+
+### Validação: forma no zod, regra no domínio
+
+- **zod 4.6.7** valida só a forma: objetos estritos (campo desconhecido → 400; pega um
+  `referenceExternalTransactionID` digitado errado, que seria ignorado em silêncio), tipos, textos de
+  1 a 255 caracteres não vazios (mesma regra dos CHECKs do schema), UUID e o header `Idempotency-Key`
+  (obrigatório, 1 a 255). Os erros trazem `details` com o caminho de cada campo.
+- As regras semânticas continuam no domínio e nos use cases, sem duplicação: formato estrito do
+  `Money` (`"25"` → `INVALID_AMOUNT`), OPENING (`KIND_NOT_ALLOWED`), provider `internal`
+  (`PROVIDER_RESERVED`), referência obrigatória ou proibida. Por isso `kind` é só `string` no zod: se
+  ele fosse um enum, o OPENING receberia um `INVALID_PAYLOAD` genérico em vez do código próprio.
+- `internal` é recusado no POST. O GET por external id aceita, o que permite consultar uma OPENING.
+
+**UUIDs em qualquer caixa, normalizados para minúsculas** (revê a decisão da Fase 3, que recusava
+maiúsculas). UUID é case-insensitive (RFC 9562), então recusar puniria uma grafia válida. A
+normalização fica em `requireUuid` (camada de aplicação), **antes do hash**, e por isso vale igual para
+HTTP e SQS: `ABC…` e `abc…` são o mesmo identificador, geram o mesmo `payloadHash` e viram replay, não
+conflito. Também não há falso `WALLET_PLAYER_MISMATCH`, porque o Postgres devolve minúsculas.
+
+### Status: por categoria, igual em todos os endpoints
+
+Um filtro global (`ApiExceptionFilter` + `mapError`) traduz pela **categoria** do catálogo de códigos
+(seção 8), nunca por código solto. Um código novo cai automaticamente no status certo.
+
+| Situação                                                                              | Status                                  |
+| ------------------------------------------------------------------------------------- | --------------------------------------- |
+| Transação PROCESSED (nova ou replay)                                                  | 200 (201 na criação de wallet)          |
+| PENDING_REFERENCE (nova ou replay)                                                    | 202                                     |
+| Forma inválida, `ValidationError` do domínio, JSON malformado, header, cursor/limit   | 400                                     |
+| `WALLET_NOT_FOUND`, `TRANSACTION_NOT_FOUND`, rota inexistente (`ROUTE_NOT_FOUND`)     | 404                                     |
+| `IDEMPOTENCY_KEY_REUSED`, `EXTERNAL_TRANSACTION_ID_CONFLICT`, `WALLET_ALREADY_EXISTS` | 409                                     |
+| REJECTED (rejeição de negócio, com `failureCode`)                                     | 422                                     |
+| FAILED (`INTERNAL_PERMANENT_ERROR`, só aparece em replay)                             | 422                                     |
+| `TransientFailureError` (lock timeout, deadlock, conexão, depois do retry interno)    | 503 + `Retry-After`                     |
+| Qualquer outro erro (integridade, `StaleWalletVersionError`, invariante violada, bug) | 500 `INTERNAL_ERROR`, mensagem genérica |
+
+- **FAILED → 422, não 5xx:** FAILED é terminal; reenviar só devolve o replay. Um 5xx convidaria o
+  provedor a tentar de novo, e é exatamente o que ele não deve fazer.
+- **503 é o único status que diz "reenvie a mesma requisição".** `Retry-After` vem de
+  `HTTP_RETRY_AFTER_SECONDS` (padrão 1 s). O reenvio é seguro: o erro transitório abortou a transação,
+  e a idempotência persistente cobre até um COMMIT ambíguo.
+- **500 não vaza detalhe interno** (SQLSTATE, nome de constraint): o corpo é genérico e a causa vai
+  para o log com o `correlationId`.
+- **Consultas devolvem 200 para o que existe**, mesmo uma transação REJECTED: o 422 descreve o
+  resultado de uma submissão, não de uma leitura.
+
+### Corpo da transação e formato de erro
+
+- `POST /wagering/transactions` responde **sempre** `{ transactionId, status, failureCode?, balance?,
+idempotentReplay }`, em 200, 202 e 422, novo ou replay. O status HTTP vem do `status` da transação
+  (`httpStatusForResult`), então o replay de um REJECTED é o mesmo 422 com o mesmo corpo (só
+  `idempotentReplay` muda). A rejeição de negócio não é um "erro": ela foi persistida e tem
+  `transactionId`.
+- Todo o resto (400, 404, 409, 500, 503) usa um formato só:
+  `{ error, message, correlationId, transactionId?, details? }`. `error` é o código estável;
+  `transactionId` aparece no 409 de idempotência (a transação que já existe); `details` aparece no 400
+  de forma.
+- `/health/ready` com dependência fora devolve 503 com `{ status: "unavailable", checks }`: é resposta
+  de sonda para o orquestrador e o nginx, não erro de requisição.
+
+### Cursor do ledger
+
+`nextCursor = base64url("v1:" + walletVersion)` do último lançamento devolvido. É opaco para o
+cliente e estável: keyset em `(wallet_id, wallet_version)`, então inserts concorrentes não deslocam
+páginas e o relógio das instâncias não importa. O prefixo `v1` permite trocar o formato sem quebrar
+cursores antigos. A decodificação é estrita (alfabeto base64url, `v1:<inteiro sem zero à esquerda>`,
+inteiro seguro e ida e volta idêntica); qualquer outra coisa → 400. `limit` tem padrão 50 e máximo 200,
+e fora de 1–200 → 400, sem ajuste silencioso.
+
+### X-Correlation-Id
+
+Um middleware registrado antes do body parser e do roteador resolve o id em **toda** requisição:
+aceita o do cliente se casar com `^[A-Za-z0-9._:-]{1,128}$` (seguro para log e header); senão (ausente
+ou lixo) gera um UUIDv7. Valor inválido é substituído, não recusado: correlação é diagnóstico, não
+dado de negócio. O id volta no header de toda resposta (inclusive erro e 404 de rota), no corpo de
+erro, e entra no `RequestContext` do use case, que o grava nos eventos da outbox.
+
+### Testes
+
+- **Unitários** (`test/unit/infrastructure/http/`): cursor (ida e volta e 9 formas inválidas), tabela
+  categoria → status, `httpStatusForResult` (igual para replay) e `mapError` para cada categoria,
+  inclusive o 500 genérico.
+- **API** (`test/integration/http/`): o `ApiModule` real (controllers, pipes, filtro, use cases,
+  MikroORM, cliente SQS) servindo HTTP numa porta livre, com PostgreSQL e LocalStack reais. Cobrem cada
+  linha da tabela de status, terminando com `assertLedgerInvariant`. O 503 é real: uma conexão segura
+  o `FOR UPDATE` da wallet, uma segunda instância da API com `lock_timeout` de 100 ms esgota as 3
+  tentativas (`55P03`) e responde 503 com `Retry-After`; depois do lock solto, o reenvio da mesma
+  requisição é processado uma única vez.

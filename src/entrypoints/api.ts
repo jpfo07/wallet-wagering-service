@@ -14,7 +14,7 @@ log("starting");
 await import("reflect-metadata");
 const { createApiApp } = await import("../infrastructure/http/create-api-app.ts");
 
-const app = await createApiApp(config.instanceId);
+const app = await createApiApp();
 shutdown.register(() => app.close());
 await app.listen(config.httpPort, "0.0.0.0");
 log(`listening on port ${config.httpPort}`);

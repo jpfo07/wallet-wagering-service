@@ -47,6 +47,7 @@ describe("spike A — NestJS on Bun", () => {
       const config: AppConfig = {
         instanceId: "spike-instance",
         httpPort: 0,
+        httpRetryAfterSeconds: 1,
         workerHealthPort: 0,
         database: db.config,
         sqs: testSqsConfig(),

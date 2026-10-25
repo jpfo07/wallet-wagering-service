@@ -331,7 +331,7 @@ describe("ProcessWagerTransaction (real PostgreSQL)", () => {
         InvalidMoneyError,
       ],
       ["negative amount", { money: { amount: "-1.00", currency: "BRL" } }, InvalidMoneyError],
-      ["uppercase uuid", { walletId: "0192F291-27DD-7D3F-8071-5F8685DEEF37" }, InvalidCommandError],
+      ["malformed uuid", { walletId: "0192f291-27dd-7d3f-8071" }, InvalidCommandError],
       ["blank roundId", { roundId: "  " }, InvalidCommandError],
       ["256-char providerId", { providerId: "p".repeat(256) }, InvalidCommandError],
     ] as const)("invalid payload: %s", async (_label, patch, errorClass) => {
@@ -371,6 +371,23 @@ describe("ProcessWagerTransaction (real PostgreSQL)", () => {
       expect(await transactionRows(sql, wallet.id)).toEqual(rowsBefore);
       expect(await outboxEventTypes(sql, wallet.id)).toEqual(eventsBefore);
       expect(suite().metrics.count("idempotent_replay")).toBeGreaterThan(0);
+      await assertLedgerInvariant(sql, wallet.id);
+    });
+
+    test("uppercase UUIDs are the same identifiers: normalized before the hash → replay", async () => {
+      const { sql } = suite();
+      const wallet = await createWallet(suite().app, "100.00");
+      const command = wagerCommand(wallet, "BET", { amount: "25.00" });
+      const first = await suite().app.processWagerTransaction.execute(command, CTX);
+      const upper = {
+        ...command,
+        walletId: command.walletId.toUpperCase(),
+        playerId: command.playerId.toUpperCase(),
+      };
+      const replay = await suite().app.processWagerTransaction.execute(upper, CTX);
+      expect(first.status).toBe(WagerTransactionStatus.Processed);
+      expect(replay).toEqual({ ...first, idempotentReplay: true });
+      expect(await walletState(sql, wallet.id)).toEqual({ balance: "75.00", version: 2 });
       await assertLedgerInvariant(sql, wallet.id);
     });
 

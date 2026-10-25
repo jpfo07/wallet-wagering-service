@@ -1,8 +1,6 @@
 import { InvalidCommandError } from "./errors.ts";
 
-// Lowercase only: PostgreSQL returns uuids in lowercase, so an uppercase id would hash differently
-// from the stored one and compare unequal to it (a false WALLET_PLAYER_MISMATCH).
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_TEXT_LENGTH = 255;
 
 /** Same rule as the schema's text CHECKs: not blank and at most 255 characters. */
@@ -17,11 +15,17 @@ export function optionalText(field: string, value: unknown): string | undefined 
   return value === undefined ? undefined : requireText(field, value);
 }
 
+/**
+ * UUIDs are case-insensitive (RFC 9562), so any case is accepted and normalized to lowercase,
+ * the form PostgreSQL returns. This happens before the payload hash, for HTTP and SQS alike:
+ * an uppercase id is the same identifier (replay, not conflict) and never a false
+ * WALLET_PLAYER_MISMATCH against the stored lowercase one.
+ */
 export function requireUuid(field: string, value: unknown): string {
   if (typeof value !== "string" || !UUID_PATTERN.test(value)) {
-    throw new InvalidCommandError(`${field} must be a lowercase UUID`);
+    throw new InvalidCommandError(`${field} must be a UUID`);
   }
-  return value;
+  return value.toLowerCase();
 }
 
 export function requirePositiveInteger(field: string, value: number, max: number): number {
