@@ -150,3 +150,6 @@ vite.config.ts.timestamp-*
 
 # Arquivos temporários de teste
 test/.tmp/
+
+# Resultados do teste de carga (bun run test:load)
+scripts/load-results/
