@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # Smoke test da stack de dev (docker-compose.yml):
-#   1. sobe tudo com --wait (healthchecks) e confere que as migrations saíram com 0;
+#   1. derruba a stack com os volumes, sobe tudo do zero com --wait (healthchecks) e confere que as
+#      migrations saíram com 0;
 #   2. confere réplicas e saúde de cada serviço;
 #   3. 30 requisições pelo nginx precisam alcançar 3 instâncias distintas da API;
 #   3b. /metrics: 404 pelo nginx, 200 dentro da API e de cada worker;
 #   4. failover: derruba uma réplica, o nginx continua respondendo pelas outras; depois ela volta.
-#      Da subida ao fim do failover, NENHUMA requisição pode falhar: as do script e as de um prober em
-#      segundo plano (GET e um POST de leitura) são todas exigidas 2xx. A única espera é a do pool do
-#      nginx convergir (DNS), e cada requisição dessa espera também precisa dar 2xx;
+#      Da subida ao fim do failover, todo GET (do script e de um prober em segundo plano) precisa dar
+#      2xx. O prober também envia transações (POST com Idempotency-Key). Um POST em andamento quando
+#      a réplica morre pode receber 502/503, e o nginx não o reenvia: o prober reenvia a mesma
+#      requisição com a mesma chave, como o provedor faria. O reenvio precisa dar 2xx, e a consulta
+#      pelo id externo precisa mostrar uma única transação, com o mesmo transactionId. A única espera é
+#      a do pool do nginx convergir (DNS), e cada requisição dessa espera também precisa dar 2xx;
 #   5. SIGTERM durante o boot de um worker: para em poucos segundos com 0 ou 143, nunca 137 (SIGKILL);
 #   6. desligamento: `docker compose stop` com a stack saudável, todos os containers saem com 0.
 # Uso: scripts/compose-smoke.sh [--down]   (no fim a stack fica parada; --down também a remove com os
@@ -32,6 +36,9 @@ on_exit() {
     docker compose ps -a >&2 || true
     echo "--- últimos logs" >&2
     docker compose logs --tail=40 >&2 || true
+    # O log de acesso do nginx diz qual upstream devolveu cada resposta fora de 2xx.
+    echo "--- nginx: respostas fora de 2xx" >&2
+    docker compose logs --no-log-prefix nginx 2>/dev/null | grep '"status":' | grep -v '"status":2' >&2 || true
   fi
   if $DOWN; then docker compose down -v --remove-orphans >/dev/null 2>&1 || true; fi
   exit $rc
@@ -52,6 +59,9 @@ wait_until() {
 # Toda resposta não-2xx de qualquer requisição do smoke vai para cá; uma única linha reprova.
 ERRORS=$(mktemp)
 PROBE_STOP=$(mktemp -u)
+# POSTs do prober que precisaram de reenvio: "<externalTransactionId> <transactionId> <idempotentReplay>".
+RESENT=$(mktemp)
+RUN_ID=$(cat /proc/sys/kernel/random/uuid)
 
 # X-Instance-Id de n GETs. Uma resposta não-2xx é registrada (e reprova), nunca descartada.
 instance_ids() {
@@ -71,20 +81,55 @@ assert_no_errors() {
   [[ ! -s "$ERRORS" ]] || fail "$1: requisições sem 2xx:"$'\n'"$(head -20 "$ERRORS")"
 }
 
-# Tráfego contínuo em segundo plano: GET e um POST de leitura (reconciliação), que o nginx não pode
-# reenviar depois de enviado. Prova que nenhuma requisição se perde enquanto réplicas param e voltam.
+# Transação do prober: LOSS de 0.00 (PROCESSED, sem mover saldo), chave = externalTransactionId.
+# 502/503 → reenvia a mesma requisição, com a mesma Idempotency-Key, como o provedor faria (até 5
+# vezes, 1 s entre elas, o Retry-After da API). O resultado final precisa ser 2xx e PROCESSED.
+wager_post() {
+  local wallet="$1" player="$2" ext="$3" body response status attempt
+  body=$(printf '{"providerId":"smoke","externalTransactionId":"%s","playerId":"%s","walletId":"%s","roundId":"smoke","gameId":"smoke","kind":"LOSS","money":{"amount":"0.00","currency":"BRL"}}' \
+    "$ext" "$player" "$wallet")
+  for attempt in 1 2 3 4 5; do
+    response=$(curl -s --max-time 10 -w $'\n%{http_code}' -X POST "$BASE_URL/wagering/transactions" \
+      -H 'content-type: application/json' -H "Idempotency-Key: $ext" -d "$body") || true
+    status=${response##*$'\n'}
+    [[ "$status" == 502 || "$status" == 503 ]] || break
+    echo "$(date +%T.%3N) POST $ext -> $status (tentativa $attempt), reenviando com a mesma chave" >&2
+    sleep 1
+  done
+  response=${response%$'\n'*}
+  if [[ "$status" != 2* || "$response" != *'"status":"PROCESSED"'* ]]; then
+    echo "$(date +%T.%3N) POST $ext -> ${status:-sem resposta} depois de $attempt tentativa(s): $response" >>"$ERRORS"
+  elif ((attempt > 1)); then
+    echo "$ext $(sed -E 's/.*"transactionId":"([^"]+)".*/\1/' <<<"$response") $(grep -o '"idempotentReplay":[a-z]*' <<<"$response")" >>"$RESENT"
+  fi
+}
+
+# Tráfego contínuo em segundo plano: GETs (exigidos 2xx sempre) e transações, que o nginx não pode
+# reenviar depois de enviadas. Prova que nenhuma requisição se perde enquanto réplicas param e voltam.
 start_prober() {
-  local wallet="$1"
+  local wallet="$1" player="$2" n=0
   rm -f "$PROBE_STOP"
   (
     while [[ ! -e "$PROBE_STOP" ]]; do
-      for request in "GET /health/live" "POST /wallets/$wallet/reconciliation"; do
-        status=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -X "${request%% *}" "$BASE_URL${request#* }") || true
-        [[ "$status" == 2* ]] || echo "$(date +%T.%3N) $request -> ${status:-sem resposta}" >>"$ERRORS"
-      done
+      status=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$BASE_URL/health/live") || true
+      [[ "$status" == 2* ]] || echo "$(date +%T.%3N) GET /health/live -> ${status:-sem resposta}" >>"$ERRORS"
+      n=$((n + 1))
+      wager_post "$wallet" "$player" "probe-$RUN_ID-$n"
     done
   ) &
   PROBER_PID=$!
+}
+
+# Cada transação reenviada existe uma única vez (UNIQUE por provedor + externalTransactionId), com o
+# mesmo transactionId que o reenvio devolveu.
+assert_resent_once() {
+  local ext tx replay found
+  while read -r ext tx replay; do
+    found=$(curl -fsS "$BASE_URL/providers/smoke/wagering/transactions/$ext") ||
+      fail "reenvio de $ext: a consulta pelo id externo falhou"
+    [[ "$found" == *"\"transactionId\":\"$tx\""* ]] ||
+      fail "reenvio de $ext devolveu $tx, mas a transação gravada é outra: $found"
+  done <"$RESENT"
 }
 
 stop_prober() {
@@ -92,9 +137,21 @@ stop_prober() {
   wait "$PROBER_PID" 2>/dev/null || true
 }
 
+# Primeiro container de um serviço. Sem "| head -1": com pipefail, o head fechando o pipe antes de o
+# docker compose terminar de escrever mata o plugin por SIGPIPE e o script sai com 255, sem mensagem.
+first_container() {
+  local ids
+  ids=$(docker compose ps -q "$1")
+  [[ -n "$ids" ]] || fail "nenhum container do serviço $1"
+  echo "${ids%%$'\n'*}"
+}
+
 three_instances() { [[ "$(instance_ids 30 | sort -u | grep -c .)" == "3" ]]; }
 
-echo "==> subindo a stack"
+echo "==> subindo a stack do zero (volume novo do PostgreSQL)"
+# Sempre do zero: a primeira inicialização do volume (servidor temporário do initdb e restart) é o
+# cenário de quem clona o repositório, e foi onde as migrations já falharam com 57P03.
+docker compose down -v --remove-orphans >/dev/null 2>&1
 docker compose up -d --build --wait --wait-timeout 240
 
 echo "==> migrations"
@@ -141,11 +198,12 @@ done
 echo "ok: /metrics 404 pelo nginx; 200 com séries wws_ dentro da API e dos 3 workers"
 
 echo "==> failover: derrubando uma réplica da API (com tráfego GET e POST em segundo plano)"
+player=$(cat /proc/sys/kernel/random/uuid)
 wallet=$(curl -fsS -X POST "$BASE_URL/wallets" -H 'content-type: application/json' \
-  -d "{\"playerId\":\"$(cat /proc/sys/kernel/random/uuid)\",\"initialBalance\":{\"amount\":\"10.00\",\"currency\":\"BRL\"}}" |
+  -d "{\"playerId\":\"$player\",\"initialBalance\":{\"amount\":\"10.00\",\"currency\":\"BRL\"}}" |
   sed -E 's/.*"id":"([^"]+)".*/\1/')
-start_prober "$wallet"
-victim=$(docker compose ps -q api | head -1)
+start_prober "$wallet" "$player"
+victim=$(first_container api)
 victim_id=$(docker inspect --format '{{.Config.Hostname}}' "$victim")
 docker stop "$victim" >/dev/null
 ids=$(instance_ids 20)
@@ -161,11 +219,14 @@ wait_until 15 "nginx voltar a balancear entre 3 instâncias" three_instances
 echo "ok: réplica voltou e o nginx balanceia entre 3 instâncias de novo"
 stop_prober
 assert_no_errors "failover e reintegração"
-probes=$(docker compose logs --no-log-prefix nginx 2>/dev/null | grep -c '/reconciliation' || true)
-echo "ok: nenhuma requisição sem 2xx durante o failover (prober: ${probes} POSTs pelo nginx)"
+assert_resent_once
+probes=$(docker compose logs --no-log-prefix nginx 2>/dev/null | grep -c '"POST","uri":"/wagering/transactions"' || true)
+resent=$(grep -c . "$RESENT" || true)
+replays=$(grep -c 'idempotentReplay":true' "$RESENT" || true)
+echo "ok: todo GET com 2xx e toda transação PROCESSED durante o failover (prober: ${probes} POSTs pelo nginx; ${resent} reenviados após 502/503, ${replays} deles como replay)"
 
 echo "==> SIGTERM durante o boot de um worker"
-worker=$(docker compose ps -q sqs-consumer | head -1)
+worker=$(first_container sqs-consumer)
 docker restart "$worker" >/dev/null # volta assim que o container inicia, com o boot em andamento
 started_ns=$(date +%s%N)
 docker stop -t 15 "$worker" >/dev/null

@@ -602,6 +602,14 @@ foi removido.
 - Funções com prefixo `wws_`, `plpgsql` e `SET search_path = public` (não dependem do search_path
   de quem chama).
 - Uma migration aplicada nunca é editada; mudança de schema é uma migration nova.
+- **Banco ainda subindo não derruba as migrations:** o entrypoint (`src/entrypoints/migrate.ts`)
+  repete a execução inteira, até 10 tentativas com backoff de 500 ms a 5 s (cerca de 25 s no total),
+  quando o erro é de conexão: `57P03` (servidor iniciando), classe `08`, `57P01` ou erro de rede. A
+  regra é a mesma do `DatabaseGate` do consumidor (`isConnectionFailure`, no classificador de
+  SQLSTATE), aplicada por `withConnectionRetry`
+  (`src/infrastructure/persistence/connection-retry.ts`). Banco ocupado (lock, deadlock) e erro da
+  própria migration não são repetidos. Repetir do zero é seguro porque cada migration roda na própria
+  transação: uma que falhou foi desfeita.
 - Testes: `up → down (até zero) → up` sem sobras (`pg_class`/`pg_proc`), drift entre modelos e
   colunas (nome e nulabilidade), tipos de dinheiro e precisão de datas, e `bun run
 image:migrations-check` na imagem `--production`.
@@ -856,9 +864,11 @@ automaticamente no status certo.
 | `TransientFailureError` (lock timeout, deadlock, conexão, depois do retry interno)    | 503 + `Retry-After`                     |
 | Qualquer outro erro (integridade, `StaleWalletVersionError`, invariante violada, bug) | 500 `INTERNAL_ERROR`, mensagem genérica |
 
-- **503 é o único status que diz "reenvie a mesma requisição".** `Retry-After` vem de
+- **503 é o único status da API que diz "reenvie a mesma requisição".** `Retry-After` vem de
   `HTTP_RETRY_AFTER_SECONDS` (padrão 1 s). O reenvio é seguro: o erro transitório abortou a transação,
-  e a idempotência persistente cobre até um COMMIT ambíguo.
+  e a idempotência persistente cobre até um COMMIT ambíguo. Um 502 vem do nginx, não da API (réplica
+  morreu com o POST em andamento), e se trata do mesmo jeito (ver
+  [Limitações](#16-limitações-conhecidas-e-próximos-passos)).
 - **500 não vaza detalhe interno** (SQLSTATE, nome de constraint): o corpo é genérico e a causa vai
   para o log com o `correlationId`.
 - **Consultas devolvem 200 para o que existe**, mesmo uma transação REJECTED: o 422 descreve o
@@ -1204,6 +1214,14 @@ escolhe o comando.
 - **Ordem de subida pelos healthchecks, não pela ordem de declaração:** `depends_on` com
   `service_healthy` e `service_completed_successfully`. O LocalStack só fica saudável quando o script
   de init terminou, ou seja, as filas existem antes de qualquer consumidor subir.
+- **Healthcheck do PostgreSQL por TCP** (`pg_isready -h 127.0.0.1 -U wallet -d wallet`, nos dois
+  compose, com `start_period` de 30 s). Na primeira inicialização de um volume, a imagem oficial sobe
+  um servidor temporário **só no socket local** (initdb e scripts de init) e depois reinicia para o
+  servidor definitivo. O `pg_isready` pelo socket respondia "ok" nessa fase: o serviço ficava
+  `healthy`, as migrations conectavam durante o restart e saíam com `57P03` ("the database system is
+  starting up"). Isso só aparecia em clone limpo, com volume novo. Por TCP só o servidor definitivo
+  responde. O retry das migrations (ver [Migrations](#migrations)) é a segunda camada, para o caso de
+  o banco reiniciar depois de ficar saudável.
 - **Migrations num serviço próprio, que roda uma vez:** as réplicas da API nunca disputam a execução de
   migrations no boot, e se a migration falhar nenhuma aplicação sobe.
 - **Uma única porta da API (8080, no nginx).** Postgres e LocalStack ficam expostos só em `127.0.0.1`,
@@ -1272,17 +1290,24 @@ paradas imediatas; a diferença é só se o handler já estava instalado.
 
 ### Prova automatizada (`scripts/compose-smoke.sh`, também no CI)
 
-1. todos os serviços `healthy`, na quantidade esperada de réplicas, e migrations com exit 0;
+1. começa sempre do zero (`docker compose down -v` antes do `up`), para cobrir a primeira
+   inicialização do volume do PostgreSQL; todos os serviços `healthy`, na quantidade esperada de
+   réplicas, e migrations com exit 0;
 2. 30 requisições pelo nginx atendidas por 3 instâncias distintas (na execução local: 10/10/10),
    depois da convergência do pool do nginx (o `up` pode ter recriado as APIs), com toda requisição
    obrigada a dar 2xx;
 3. `/metrics` responde 404 pelo nginx (inclusive `/metrics/` e com query) e 200 com séries `wws_`
    dentro da API e de cada worker;
-4. failover com tráfego em segundo plano. Um prober faz GET e um POST de leitura (reconciliação)
-   sem parar, enquanto uma réplica para e volta:
+4. failover com tráfego em segundo plano. Um prober faz GETs e envia transações (LOSS de 0,00, com
+   `Idempotency-Key` única) sem parar, enquanto uma réplica para e volta:
    - com a réplica parada, 20/20 requisições têm sucesso pelas outras duas;
    - a réplica volta a `healthy` e o nginx volta a balancear entre 3;
-   - **nenhuma** requisição, do script ou do prober, pode ter resposta fora de 2xx;
+   - **todo GET**, do script ou do prober, precisa dar 2xx;
+   - **toda transação** termina 2xx e PROCESSED. Um POST que recebe 502/503 é reenviado com a mesma
+     chave, como o provedor faria (até 5 vezes, 1 s entre elas, o `Retry-After`). Depois, a consulta
+     pelo id externo precisa mostrar uma única transação, com o mesmo `transactionId` que o reenvio
+     devolveu (replay, se a primeira tentativa chegou a commitar). O smoke informa quantos POSTs
+     precisaram de reenvio;
    - a única espera é a convergência do pool do nginx (DNS), e cada requisição dessa espera também
      precisa dar 2xx;
 5. um `sqs-consumer` recebe `docker stop` logo depois de reiniciar (boot em andamento) e precisa sair
@@ -1774,10 +1799,13 @@ O resultado é o mesmo saldo exato, sem perda e sem efeito duplo.
     (`HTTP_SHUTDOWN_DRAIN_MS`, `src/infrastructure/http/http-drain.ts`) com `Connection: close` e
     readiness 503.
   - **Smoke estrito** (ver [Prova automatizada](#prova-automatizada-scriptscompose-smokesh-também-no-ci)):
-    nenhuma requisição pode ter resposta fora de 2xx, inclusive um prober em segundo plano com POST
-    de leitura.
+    nenhum GET pode ter resposta fora de 2xx, inclusive os de um prober em segundo plano que também
+    envia POSTs.
 - **Resultado:** 3 smokes seguidos sem nenhuma resposta não-2xx, com mais de mil POSTs pelo nginx
   durante failover e reintegração.
+- **Depois:** numa rodada posterior, um POST do prober recebeu 502 durante o failover (1 em 3
+  rodadas). É o caso residual registrado em [Limitações](#16-limitações-conhecidas-e-próximos-passos):
+  o smoke passou a reenviar esse POST com a mesma chave e a exigir uma única transação.
 
 ### Teste de carga (`bun run test:load`)
 
@@ -1986,6 +2014,17 @@ Correspondência com a seção 14 do enunciado. Caminhos relativos à raiz do re
 - **Prêmio duplicado com ids diferentes:** um provedor com bug que reenvia o mesmo WIN com outro
   `externalTransactionId` gera dois créditos legítimos do ponto de vista do serviço. A idempotência
   protege contra reenvio do mesmo id, não contra ids diferentes.
+
+**Failover da API**
+
+- **Um POST em andamento no instante em que a réplica morre pode receber 502.** O drain da API e o
+  keepalive curto do nginx eliminam o caso comum (socket ocioso reusado), mas não todos. Se a
+  requisição já foi enviada à réplica que caiu, o nginx não a reenvia (POST não é idempotente para
+  ele, de propósito), e o cliente recebe 502. É raro (um 502 em três rodadas do smoke, depois de
+  rodadas com mais de mil POSTs sem nenhum), e **o reenvio com a mesma `Idempotency-Key` é seguro**:
+  se a primeira tentativa commitou, o reenvio devolve o replay; se não, ela é processada uma vez. O
+  smoke prova isso reenviando e conferindo uma única transação. O provedor precisa tratar 502 como
+  503: reenviar a mesma requisição.
 
 **Mensageria**
 

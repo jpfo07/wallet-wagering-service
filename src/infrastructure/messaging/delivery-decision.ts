@@ -7,6 +7,7 @@ import {
 import type { WagerTransactionResult } from "../../application/views.ts";
 import { ValidationError } from "../../domain/shared/domain-error.ts";
 import { CodeCategory, ERROR_CODE_CATALOG, ErrorCode } from "../../domain/shared/failure-code.ts";
+import { isConnectionFailure } from "../persistence/persistence-error-classifier.ts";
 
 /** Codes that exist only in the consumer (never raised by a use case). */
 export enum ConsumerFailureCode {
@@ -98,21 +99,4 @@ export function decideForError(error: unknown): DeliveryDecision {
 
 function transientReason(error: TransientFailureError): string {
   return error.cause instanceof TransientPersistenceError ? error.cause.reason : "unknown";
-}
-
-/** Reasons from persistence-error-classifier that mean "no database", not "busy database". */
-const CONNECTION_REASONS: ReadonlySet<string> = new Set([
-  "57P01", // admin_shutdown
-  "57P03", // cannot_connect_now
-  "ECONNREFUSED",
-  "ECONNRESET",
-  "ETIMEDOUT",
-  "EPIPE",
-  "EHOSTUNREACH",
-  "EAI_AGAIN",
-  "connection",
-]);
-
-export function isConnectionFailure(reason: string): boolean {
-  return reason.startsWith("08") || CONNECTION_REASONS.has(reason);
 }

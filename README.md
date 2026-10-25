@@ -50,9 +50,10 @@ curl -s localhost:8080/health/ready   # {"status":"ok","checks":{"postgres":"up"
 docker compose down                   # -v também apaga o volume do PostgreSQL
 ```
 
-Prova automatizada (a mesma do CI): `bun run compose:smoke --down` sobe tudo e confere a saúde e o
-número de réplicas, o balanceamento entre 3 instâncias, o failover sem nenhuma resposta fora de 2xx,
-o `/metrics` fora do nginx e o desligamento com exit 0. No fim, derruba a stack.
+Prova automatizada (a mesma do CI): `bun run compose:smoke --down` sobe tudo do zero e confere a
+saúde e o número de réplicas, o balanceamento entre 3 instâncias, o failover sem nenhuma resposta
+fora de 2xx, o `/metrics` fora do nginx e o desligamento com exit 0. No fim, derruba a stack.
+**Atenção:** ele começa com `docker compose down -v`, então apaga o volume do PostgreSQL de dev.
 
 ## Testes
 

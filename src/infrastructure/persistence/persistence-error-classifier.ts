@@ -77,3 +77,20 @@ function stringField(error: unknown, key: string): string | undefined {
   const value: unknown = (error as Record<string, unknown>)[key];
   return typeof value === "string" ? value : undefined;
 }
+
+/** Transient reasons that mean "no database", not "busy database" (lock, deadlock, saturation). */
+const CONNECTION_REASONS: ReadonlySet<string> = new Set([
+  "57P01", // admin_shutdown
+  "57P03", // cannot_connect_now
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "ETIMEDOUT",
+  "EPIPE",
+  "EHOSTUNREACH",
+  "EAI_AGAIN",
+  "connection",
+]);
+
+export function isConnectionFailure(reason: string): boolean {
+  return reason.startsWith("08") || CONNECTION_REASONS.has(reason);
+}

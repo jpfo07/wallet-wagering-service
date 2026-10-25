@@ -26,10 +26,16 @@ services:
     ports:
       - "55432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U wallet -d wallet"]
+      # Por TCP, não pelo socket: na primeira inicialização do volume a imagem sobe um servidor
+      # temporário só no socket local (initdb e scripts) e depois reinicia. O pg_isready pelo socket
+      # dava "ok" nessa fase, e quem conectava no restart levava 57P03. Por 127.0.0.1 só responde o
+      # servidor definitivo.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-p", "5432", "-U", "wallet", "-d", "wallet"]
       interval: 2s
       timeout: 3s
       retries: 30
+      start_period: 30s
+      start_interval: 1s
 
   localstack:
     # Última imagem community (Apache 2.0); fixada por tag + digest.

@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { ConnectionException, DeadlockException, DriverException } from "@mikro-orm/core";
 import { UniqueTarget } from "../../../src/application/errors.ts";
-import { classifyPersistenceError } from "../../../src/infrastructure/persistence/persistence-error-classifier.ts";
+import {
+  classifyPersistenceError,
+  isConnectionFailure,
+} from "../../../src/infrastructure/persistence/persistence-error-classifier.ts";
 
 /** What the pg driver hands to MikroORM: an Error with `code` (SQLSTATE) and `constraint`. */
 function pgError(code: string, constraint?: string): Error {
@@ -85,5 +88,19 @@ describe("classifyPersistenceError (by SQLSTATE, never by class or message)", ()
   test("non-errors and errors without a code are 'other'", () => {
     expect(classifyPersistenceError("boom")).toEqual({ kind: "other" });
     expect(classifyPersistenceError(new Error("no code"))).toEqual({ kind: "other" });
+  });
+});
+
+describe("isConnectionFailure", () => {
+  test.each([
+    ["08001", true],
+    ["57P01", true],
+    ["57P03", true],
+    ["ECONNRESET", true],
+    ["55P03", false],
+    ["40P01", false],
+    ["53300", false],
+  ])("%s → %p", (reason, expected) => {
+    expect(isConnectionFailure(reason)).toBe(expected);
   });
 });

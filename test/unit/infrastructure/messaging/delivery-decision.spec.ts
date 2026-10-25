@@ -20,7 +20,6 @@ import {
   ConsumerFailureCode,
   decideForError,
   decideForResult,
-  isConnectionFailure,
 } from "../../../../src/infrastructure/messaging/delivery-decision.ts";
 
 const transient = (reason: string) =>
@@ -114,18 +113,5 @@ describe("decideForError", () => {
       databaseUnavailable: false,
       log: "error",
     });
-  });
-});
-
-describe("isConnectionFailure", () => {
-  test.each([
-    ["08001", true],
-    ["57P01", true],
-    ["ECONNRESET", true],
-    ["55P03", false],
-    ["40P01", false],
-    ["53300", false],
-  ])("%s → %p", (reason, expected) => {
-    expect(isConnectionFailure(reason)).toBe(expected);
   });
 });
