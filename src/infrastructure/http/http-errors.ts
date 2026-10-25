@@ -14,7 +14,7 @@ export interface ErrorDetail {
   readonly message: string;
 }
 
-/** The one error body of the API (400, 404, 409, 500, 503). */
+/** The one error body of the API (400, 401, 403, 404, 409, 500, 503). */
 export interface ApiErrorBody {
   readonly error: ErrorCode | HttpErrorCode;
   readonly message: string;

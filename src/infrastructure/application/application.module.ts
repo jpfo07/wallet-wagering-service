@@ -12,6 +12,8 @@ import { CreateWallet } from "../../application/wallet/create-wallet.ts";
 import { ReconcileWallet } from "../../application/wallet/reconcile-wallet.ts";
 import { APP_CONFIG } from "../config/config.module.ts";
 import type { AppConfig } from "../config/env.ts";
+import { PROCESS_TELEMETRY } from "../observability/observability.module.ts";
+import type { ProcessTelemetry } from "../observability/process-telemetry.ts";
 import { buildApplication } from "./composition.ts";
 import type { Application } from "./composition.ts";
 
@@ -34,9 +36,10 @@ const fromApplication = <T>(
   providers: [
     {
       provide: APPLICATION,
-      inject: [MikroORM, APP_CONFIG],
+      inject: [MikroORM, APP_CONFIG, PROCESS_TELEMETRY],
       // The Nest provider is the PostgreSQL MikroORM instance, registered under the core token.
-      useFactory: (orm: PostgreSqlMikroORM, config: AppConfig) => buildApplication(orm, config),
+      useFactory: (orm: PostgreSqlMikroORM, config: AppConfig, telemetry: ProcessTelemetry) =>
+        buildApplication(orm, config, { logger: telemetry.logger, metrics: telemetry.metrics }),
     },
     fromApplication(ProcessWagerTransaction, (app) => app.processWagerTransaction),
     fromApplication(CreateWallet, (app) => app.createWallet),

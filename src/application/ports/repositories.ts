@@ -84,6 +84,8 @@ export interface WagerTransactionRepository {
 export interface PendingReferenceCandidate {
   readonly transactionId: string;
   readonly walletId: string;
+  /** For the worker's logs; the events take it from the transaction read under the lock. */
+  readonly correlationId?: string | undefined;
 }
 
 export interface ReconciliationSnapshot {

@@ -1,6 +1,7 @@
 import { Controller, Get, Inject, Res } from "@nestjs/common";
 import { MikroORM } from "@mikro-orm/core";
 import { SQSClient } from "@aws-sdk/client-sqs";
+import { Public } from "../auth/public.decorator.ts";
 import { APP_CONFIG } from "../config/config.module.ts";
 import type { AppConfig } from "../config/env.ts";
 import { SQS_CLIENT } from "../messaging/messaging.module.ts";
@@ -8,6 +9,8 @@ import { checkReadiness } from "../observability/readiness.ts";
 import type { ReadinessReport } from "../observability/readiness.ts";
 import type { HttpResponse } from "./request-context.decorator.ts";
 
+/** Open by design (section 2): orchestrator and proxy probes carry no provider credentials. */
+@Public()
 @Controller("health")
 export class HealthController {
   constructor(

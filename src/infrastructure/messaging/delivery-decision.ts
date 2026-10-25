@@ -68,7 +68,11 @@ export function decideForError(error: unknown): DeliveryDecision {
     const code: string = (error as ValidationError | ApplicationError).code;
     if (isErrorCode(code)) {
       switch (ERROR_CODE_CATALOG[code].category) {
+        // The queue is an internal channel (no provider credentials), so the auth categories never
+        // happen there; if they did, no redelivery could change the answer.
         case CodeCategory.InvalidPayload:
+        case CodeCategory.Unauthenticated:
+        case CodeCategory.Forbidden:
           return { action: "dlq", failureCode: code, reason: error.message };
         case CodeCategory.NotFound:
         case CodeCategory.Conflict:

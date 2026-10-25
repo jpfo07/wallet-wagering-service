@@ -4,13 +4,14 @@ import {
   SendMessageCommand,
 } from "@aws-sdk/client-sqs";
 import type { Message, SQSClient } from "@aws-sdk/client-sqs";
+import type { Registry } from "prom-client";
 import type { LogFields, Logger } from "../../src/application/ports/telemetry.ts";
 import type { WagerTransactionCommand } from "../../src/application/wager/process-wager-transaction.ts";
 import type { DatabaseConfig, SqsConsumerConfig } from "../../src/infrastructure/config/env.ts";
 import { startWagerConsumer } from "../../src/infrastructure/messaging/start-wager-consumer.ts";
 import type { RunningWagerConsumer } from "../../src/infrastructure/messaging/start-wager-consumer.ts";
 import { WAGER_TRANSACTION_REQUESTED } from "../../src/infrastructure/messaging/wager-message-envelope.ts";
-import { InMemoryConsumerMetrics } from "../../src/infrastructure/observability/telemetry-adapters.ts";
+import { InMemoryConsumerMetrics } from "./in-memory-telemetry.ts";
 import { MathRandomSource, SystemClock } from "../../src/infrastructure/system/system-adapters.ts";
 import type { AppHandle } from "./application-suite.ts";
 import type { IsolatedQueues } from "./queues.ts";
@@ -55,6 +56,8 @@ export async function startTestConsumer(options: {
   readonly handle: AppHandle;
   readonly database: DatabaseConfig;
   readonly consumer?: Partial<SqsConsumerConfig>;
+  /** Registers the DLQ depth gauge on it, as the sqs-consumer process does. */
+  readonly metricsRegistry?: Registry;
 }): Promise<TestConsumer> {
   const logger = new CapturingLogger();
   const metrics = new InMemoryConsumerMetrics();
@@ -74,6 +77,7 @@ export async function startTestConsumer(options: {
     random: new MathRandomSource(),
     logger,
     metrics,
+    ...(options.metricsRegistry === undefined ? {} : { metricsRegistry: options.metricsRegistry }),
   });
   return { ...running, logger, metrics };
 }

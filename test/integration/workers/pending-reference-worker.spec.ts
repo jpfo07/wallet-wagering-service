@@ -68,6 +68,52 @@ describe("PENDING_REFERENCE worker (real PostgreSQL)", () => {
     return { candidates: mine.map((candidate) => candidate.transactionId), outcomes };
   }
 
+  test("events of a re-check keep the correlationId of the request that created the transaction", async () => {
+    const { sql } = suite();
+    const clock = new ManualClock();
+    const handle = await handleWith(clock, LONG_BACKOFF);
+    const wallet = await createWallet(handle.app, "100.00");
+    const refund = await handle.app.processWagerTransaction.execute(
+      wagerCommand(wallet, "REFUND", { amount: "30.00", reference: "bet-corr" }),
+      { correlationId: "corr-refund-original" },
+    );
+    await handle.app.processWagerTransaction.execute(
+      wagerCommand(wallet, "BET", { externalTransactionId: "bet-corr", amount: "30.00" }),
+      { correlationId: "corr-bet" },
+    );
+    const stored: { correlation_id: string | null }[] = await sql.unsafe(
+      `select correlation_id from wager_transactions where id = $1`,
+      [refund.transactionId],
+    );
+    expect(stored).toEqual([{ correlation_id: "corr-refund-original" }]);
+
+    expect((await cycle(handle, wallet.id)).outcomes).toEqual(["PROCESSED"]);
+    const events: { event_type: string; correlation_id: string; causation_id: string }[] =
+      await sql.unsafe(
+        `select event_type, payload->>'correlationId' as correlation_id,
+                payload->>'causationId' as causation_id
+           from outbox_messages where aggregate_id = $1 and payload->>'causationId' = $2
+          order by sequence`,
+        [wallet.id, refund.transactionId],
+      );
+    expect(events).toEqual([
+      {
+        event_type: "WagerTransactionProcessed",
+        correlation_id: "corr-refund-original",
+        causation_id: refund.transactionId,
+      },
+      {
+        event_type: "WalletBalanceChanged",
+        correlation_id: "corr-refund-original",
+        causation_id: refund.transactionId,
+      },
+    ]);
+    expect(
+      handle.metrics.count("wager_transaction{kind=REFUND,status=PROCESSED,source=pending_worker}"),
+    ).toBe(1);
+    await assertLedgerInvariant(sql, wallet.id);
+  });
+
   test("REFUND before its BET: the BET brings the check forward and the very next cycle resolves it", async () => {
     const { sql } = suite();
     const clock = new ManualClock();

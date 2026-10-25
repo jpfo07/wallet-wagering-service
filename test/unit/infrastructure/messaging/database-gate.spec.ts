@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { Clock } from "../../../../src/application/ports/system.ts";
 import { ExponentialBackoff } from "../../../../src/domain/shared/backoff-policy.ts";
 import { DatabaseGate } from "../../../../src/infrastructure/messaging/database-gate.ts";
-import { SilentLogger } from "../../../../src/infrastructure/observability/telemetry-adapters.ts";
+import { SilentLogger } from "../../../support/in-memory-telemetry.ts";
 import { waitFor } from "../../../support/polling.ts";
 
 class ManualClock implements Clock {

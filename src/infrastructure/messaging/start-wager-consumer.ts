@@ -1,4 +1,5 @@
 import type { SQSClient } from "@aws-sdk/client-sqs";
+import type { Registry } from "prom-client";
 import type { Clock, RandomSource } from "../../application/ports/system.ts";
 import type { Logger } from "../../application/ports/telemetry.ts";
 import type { ProcessWagerTransaction } from "../../application/wager/process-wager-transaction.ts";
@@ -9,6 +10,7 @@ import type {
   SqsConsumerConfig,
   TransientRetryConfig,
 } from "../config/env.ts";
+import { registerDlqDepthGauge } from "../observability/prometheus-metrics.ts";
 import { DatabaseGate } from "./database-gate.ts";
 import { inspectWagerQueue } from "./queue-attributes.ts";
 import { assertVisibilityBudget, worstCaseProcessingMs } from "./visibility-budget.ts";
@@ -28,7 +30,12 @@ export interface WagerConsumerSetup {
   readonly random: RandomSource;
   readonly logger: Logger;
   readonly metrics: ConsumerMetrics;
+  /** When present, the DLQ depth gauge is registered on it (the queue URL is known after boot). */
+  readonly metricsRegistry?: Registry;
 }
+
+/** The DLQ depth is read at scrape time; a slow SQS must not hold the scrape. */
+export const DLQ_DEPTH_TIMEOUT_MS = 2_000;
 
 export interface RunningWagerConsumer {
   readonly consumer: WagerQueueConsumer;
@@ -51,6 +58,15 @@ export async function startWagerConsumer(setup: WagerConsumerSetup): Promise<Run
     processingMarginMs: setup.consumer.processingMarginMs,
   };
   assertVisibilityBudget(topology.visibilityTimeoutSeconds, budget);
+  if (setup.metricsRegistry !== undefined) {
+    registerDlqDepthGauge(setup.metricsRegistry, {
+      sqs: setup.sqs,
+      dlqUrl: topology.dlqUrl,
+      queueName: setup.sqsConfig.wagerDlqName,
+      timeoutMs: DLQ_DEPTH_TIMEOUT_MS,
+      logger: setup.logger,
+    });
+  }
 
   const gate = new DatabaseGate(
     setup.pingDatabase,

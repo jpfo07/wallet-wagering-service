@@ -11,10 +11,7 @@ import type {
   DatabaseConfig,
   PendingReferenceConfig,
 } from "../../src/infrastructure/config/env.ts";
-import {
-  InMemoryApplicationMetrics,
-  SilentLogger,
-} from "../../src/infrastructure/observability/telemetry-adapters.ts";
+import { InMemoryApplicationMetrics, SilentLogger } from "./in-memory-telemetry.ts";
 import { buildOrmOptions } from "../../src/infrastructure/persistence/mikro-orm.config.ts";
 import { createIsolatedDatabase, openSql } from "./database.ts";
 import type { IsolatedDatabase } from "./database.ts";

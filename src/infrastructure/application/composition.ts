@@ -22,7 +22,11 @@ import type {
   PendingReferenceConfig,
   TransientRetryConfig,
 } from "../config/env.ts";
-import { InMemoryApplicationMetrics, JsonLineLogger } from "../observability/telemetry-adapters.ts";
+import { PinoLogger } from "../observability/pino-logger.ts";
+import {
+  PrometheusApplicationMetrics,
+  createMetricsRegistry,
+} from "../observability/prometheus-metrics.ts";
 import { MikroOrmUnitOfWork } from "../persistence/mikro-orm-unit-of-work.ts";
 import {
   MathRandomSource,
@@ -74,8 +78,19 @@ export function buildApplication(
     ids: overrides.ids ?? new UuidV7IdGenerator(),
     random: overrides.random ?? new MathRandomSource(),
     sleeper: overrides.sleeper ?? new TimerSleeper(),
-    logger: overrides.logger ?? new JsonLineLogger({ instanceId: config.instanceId }),
-    metrics: overrides.metrics ?? new InMemoryApplicationMetrics(),
+    // Processes pass their ObservabilityModule telemetry; these are for standalone compositions.
+    logger:
+      overrides.logger ??
+      PinoLogger.create({ base: { process: "application", instanceId: config.instanceId } }),
+    metrics:
+      overrides.metrics ??
+      new PrometheusApplicationMetrics(
+        createMetricsRegistry({
+          process: "application",
+          instanceId: config.instanceId,
+          defaultMetrics: false,
+        }),
+      ),
   };
   const runner = new TransactionRunner(
     deps.unitOfWork,

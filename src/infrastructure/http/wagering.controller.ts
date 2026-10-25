@@ -45,7 +45,12 @@ export class WageringController {
   getByExternalId(
     @Param("providerId") providerId: string,
     @Param("externalTransactionId") externalTransactionId: string,
+    @Ctx() context: RequestContext,
   ): Promise<TransactionView> {
-    return this.getTransactionByExternalId.execute(providerId, externalTransactionId);
+    return this.getTransactionByExternalId.execute(
+      providerId,
+      externalTransactionId,
+      context.principal,
+    );
   }
 }

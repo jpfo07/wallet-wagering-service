@@ -1,12 +1,9 @@
 import { loadConfig } from "../infrastructure/config/env.ts";
+import { bootLog } from "../infrastructure/observability/boot-log.ts";
 import { installGracefulShutdown } from "./graceful-shutdown.ts";
 
 const config = loadConfig();
-const log = (message: string): void => {
-  console.log(
-    JSON.stringify({ level: "info", process: "api", instanceId: config.instanceId, message }),
-  );
-};
+const log = bootLog({ process: "api", instanceId: config.instanceId });
 
 // Signal handler first, heavy modules after it (see graceful-shutdown.ts).
 const shutdown = installGracefulShutdown({ timeoutMs: 10_000, log });

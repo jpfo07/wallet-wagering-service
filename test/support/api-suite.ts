@@ -10,7 +10,13 @@ import { APP_CONFIG } from "../../src/infrastructure/config/config.module.ts";
 import type { AppConfig, DatabaseConfig } from "../../src/infrastructure/config/env.ts";
 import { ApiModule } from "../../src/infrastructure/http/api.module.ts";
 import { configureApiApp } from "../../src/infrastructure/http/create-api-app.ts";
-import { SilentLogger } from "../../src/infrastructure/observability/telemetry-adapters.ts";
+import type { DestinationStream } from "pino";
+import type { ProviderIdentityPort } from "../../src/application/ports/provider-identity.ts";
+import { PROVIDER_IDENTITY } from "../../src/infrastructure/auth/auth.guard.ts";
+import { PROCESS_TELEMETRY } from "../../src/infrastructure/observability/observability.module.ts";
+import { createProcessTelemetry } from "../../src/infrastructure/observability/process-telemetry.ts";
+import type { ProcessTelemetry } from "../../src/infrastructure/observability/process-telemetry.ts";
+import { NoopProviderIdentityAdapter } from "../../src/infrastructure/auth/noop-provider-identity.adapter.ts";
 import { createIsolatedDatabase, openSql } from "./database.ts";
 import type { IsolatedDatabase } from "./database.ts";
 import {
@@ -50,12 +56,21 @@ export interface ApiSuite extends ApiHandle {
 
 export const RETRY_AFTER_SECONDS = 7;
 
+export interface ApiSuiteOptions {
+  /** Where the pino logger writes (default: discarded). */
+  readonly logDestination?: DestinationStream;
+  /** Identity adapter behind the AuthGuard (default: the no-op one). */
+  readonly identity?: ProviderIdentityPort;
+}
+
+const DISCARD: DestinationStream = { write: () => undefined };
+
 /**
- * The real ApiModule (controllers, pipes, filter, use cases, MikroORM, SQS client) on one
+ * The real ApiModule (controllers, pipes, filter, guard, use cases, MikroORM, SQS client) on one
  * isolated database and the LocalStack of the test stack, served over real HTTP on a free port.
- * Only the logger is silenced.
+ * Logs are discarded unless a destination is given; process metrics are off.
  */
-export function useApiSuite(name: string): () => ApiSuite {
+export function useApiSuite(name: string, options: ApiSuiteOptions = {}): () => ApiSuite {
   let suite: ApiSuite | undefined;
   const apps: INestApplication[] = [];
 
@@ -76,11 +91,25 @@ export function useApiSuite(name: string): () => ApiSuite {
     const moduleRef = await Test.createTestingModule({ imports: [ApiModule] })
       .overrideProvider(APP_CONFIG)
       .useValue(config)
+      .overrideProvider(PROCESS_TELEMETRY)
+      .useValue(
+        createProcessTelemetry({
+          process: "api",
+          instanceId: config.instanceId,
+          defaultMetrics: false,
+          logDestination: options.logDestination ?? DISCARD,
+        }),
+      )
+      .overrideProvider(PROVIDER_IDENTITY)
+      .useValue(options.identity ?? new NoopProviderIdentityAdapter())
       .overrideProvider(APPLICATION)
       .useFactory({
-        inject: [MikroORM, APP_CONFIG],
-        factory: (orm: PostgreSqlMikroORM, appConfig: AppConfig) =>
-          buildApplication(orm, appConfig, { logger: new SilentLogger() }),
+        inject: [MikroORM, APP_CONFIG, PROCESS_TELEMETRY],
+        factory: (orm: PostgreSqlMikroORM, appConfig: AppConfig, telemetry: ProcessTelemetry) =>
+          buildApplication(orm, appConfig, {
+            logger: telemetry.logger,
+            metrics: telemetry.metrics,
+          }),
       })
       .compile();
     const app = configureApiApp(moduleRef.createNestApplication({ logger: false }));

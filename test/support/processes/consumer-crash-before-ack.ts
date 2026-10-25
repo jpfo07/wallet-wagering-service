@@ -12,7 +12,7 @@ import { buildApplication } from "../../../src/infrastructure/application/compos
 import { loadConfig } from "../../../src/infrastructure/config/env.ts";
 import { createSqsClient } from "../../../src/infrastructure/messaging/sqs-client.factory.ts";
 import { startWagerConsumer } from "../../../src/infrastructure/messaging/start-wager-consumer.ts";
-import { InMemoryConsumerMetrics } from "../../../src/infrastructure/observability/telemetry-adapters.ts";
+import { InMemoryConsumerMetrics } from "../in-memory-telemetry.ts";
 import { buildOrmOptions } from "../../../src/infrastructure/persistence/mikro-orm.config.ts";
 import { CRASH_POINT_MARKER } from "../processes.ts";
 

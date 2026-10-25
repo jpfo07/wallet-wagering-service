@@ -124,6 +124,10 @@ describe("spike A — NestJS on Bun", () => {
         const stdout = await new Response(child.stdout).text();
         expect(exitCode).toBe(0);
         expect(stdout).toContain("shutdown complete");
+        // Nest's own boot messages included: every line is JSON of the process logger.
+        const lines = stdout.trim().split("\n");
+        expect(lines.some((line) => line.includes("RouterExplorer"))).toBe(true);
+        for (const line of lines) expect(JSON.parse(line)).toMatchObject({ process: "api" });
       } finally {
         if (child.exitCode === null) child.kill("SIGKILL");
       }
@@ -152,6 +156,12 @@ describe("spike A — NestJS on Bun", () => {
             status: "ok",
             checks: { postgres: "up", sqs: "up" },
           });
+          const metrics = await fetch(`http://127.0.0.1:${port}/metrics`);
+          expect(metrics.status).toBe(200);
+          const exposition = await metrics.text();
+          expect(exposition).toContain(`process="${worker}"`);
+          expect(exposition).toContain("process_cpu_seconds_total");
+          if (worker === "sqs-consumer") expect(exposition).toContain("wws_sqs_dlq_messages{");
 
           child.kill("SIGTERM");
           const exitCode = await Promise.race([
@@ -159,7 +169,15 @@ describe("spike A — NestJS on Bun", () => {
             Bun.sleep(15_000).then(() => "timeout" as const),
           ]);
           expect(exitCode).toBe(0);
-          expect(await new Response(child.stdout).text()).toContain("shutdown complete");
+          const stdout = await new Response(child.stdout).text();
+          expect(stdout).toContain("shutdown complete");
+          // Every line is one JSON object of the same shape (boot log and pino alike).
+          for (const line of stdout.trim().split("\n")) {
+            expect(JSON.parse(line)).toMatchObject({
+              process: worker,
+              instanceId: `spike-${worker}`,
+            });
+          }
         } finally {
           if (child.exitCode === null) child.kill("SIGKILL");
         }

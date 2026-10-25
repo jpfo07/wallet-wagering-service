@@ -2,6 +2,8 @@ import type { SQSClient } from "@aws-sdk/client-sqs";
 import type { INestApplicationContext } from "@nestjs/common";
 import { loadConfig } from "../infrastructure/config/env.ts";
 import type { AppConfig } from "../infrastructure/config/env.ts";
+import type { ProcessTelemetry } from "../infrastructure/observability/process-telemetry.ts";
+import { bootLog } from "../infrastructure/observability/boot-log.ts";
 import { installGracefulShutdown } from "./graceful-shutdown.ts";
 
 export type WorkerName = "sqs-consumer" | "outbox-publisher" | "pending-reference-worker";
@@ -52,11 +54,7 @@ export function shutdownTimeoutMs(name: WorkerName, config: AppConfig): number {
  */
 export async function runWorker(name: WorkerName, start: StartWorkLoop): Promise<void> {
   const config = loadConfig();
-  const log = (message: string): void => {
-    console.log(
-      JSON.stringify({ level: "info", process: name, instanceId: config.instanceId, message }),
-    );
-  };
+  const log = bootLog({ process: name, instanceId: config.instanceId });
 
   // Signal handler first, heavy modules after it (see graceful-shutdown.ts).
   const shutdown = installGracefulShutdown({
@@ -69,6 +67,8 @@ export async function runWorker(name: WorkerName, start: StartWorkLoop): Promise
     { NestFactory },
     { MikroORM },
     { SQS_CLIENT },
+    { PROCESS_TELEMETRY },
+    { NestLoggerAdapter },
     { checkReadiness },
     { startWorkerHealthServer },
     { WorkerModule },
@@ -76,21 +76,28 @@ export async function runWorker(name: WorkerName, start: StartWorkLoop): Promise
     import("@nestjs/core"),
     import("@mikro-orm/core"),
     import("../infrastructure/messaging/messaging.module.ts"),
+    import("../infrastructure/observability/observability.module.ts"),
+    import("../infrastructure/observability/nest-logger.adapter.ts"),
     import("../infrastructure/observability/readiness.ts"),
     import("../infrastructure/observability/worker-health-server.ts"),
     import("../infrastructure/worker.module.ts"),
   ]);
 
-  const app = await NestFactory.createApplicationContext(WorkerModule, {
-    logger: ["error", "warn"],
+  const app = await NestFactory.createApplicationContext(WorkerModule.forProcess(name), {
+    bufferLogs: true,
   });
+  app.useLogger(
+    new NestLoggerAdapter(app.get<ProcessTelemetry>(PROCESS_TELEMETRY).logger, ["error", "warn"]),
+  );
   const orm = app.get(MikroORM);
   const sqs = app.get<SQSClient>(SQS_CLIENT);
+  const { registry } = app.get<ProcessTelemetry>(PROCESS_TELEMETRY);
 
   const health = startWorkerHealthServer({
     port: config.workerHealthPort,
     processName: name,
     instanceId: config.instanceId,
+    metrics: registry,
     readiness: () =>
       checkReadiness({
         pingPostgres: () => orm.em.getConnection().execute("select 1"),

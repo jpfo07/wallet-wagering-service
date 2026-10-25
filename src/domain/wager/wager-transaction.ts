@@ -28,6 +28,8 @@ export interface CreateWagerTransactionProps {
   readonly money: Money;
   /** Provider-side id of the referenced transaction, not the internal id. */
   readonly referenceExternalTransactionId?: string | undefined;
+  /** Tracing metadata of the request that created it; not a business field (outside payloadHash). */
+  readonly correlationId?: string | undefined;
   readonly createdAt: Date;
 }
 
@@ -77,6 +79,7 @@ export class WagerTransaction {
   readonly kind: WagerTransactionKind;
   readonly money: Money;
   readonly referenceExternalTransactionId: string | undefined;
+  readonly correlationId: string | undefined;
   readonly createdAt: Date;
 
   private _status: WagerTransactionStatus;
@@ -102,6 +105,7 @@ export class WagerTransaction {
     this.kind = state.kind;
     this.money = state.money;
     this.referenceExternalTransactionId = state.referenceExternalTransactionId;
+    this.correlationId = state.correlationId;
     this.createdAt = state.createdAt;
     this._status = state.status;
     this._referenceTransactionId = state.referenceTransactionId;
@@ -132,8 +136,9 @@ export class WagerTransaction {
     playerId: string;
     money: Money;
     at: Date;
+    correlationId?: string | undefined;
   }): WagerTransaction {
-    const { id, walletId, playerId, money, at } = props;
+    const { id, walletId, playerId, money, at, correlationId } = props;
     if (!money.isPositive()) {
       throw new InvalidOperationError("an OPENING transaction requires a positive amount");
     }
@@ -152,6 +157,7 @@ export class WagerTransaction {
       id,
       idempotencyKey: `${INTERNAL_PROVIDER_ID}:opening:${walletId}`,
       payloadHash: computeWagerPayloadHash(fields),
+      correlationId,
       createdAt: at,
       status: WagerTransactionStatus.Processed,
       processedAt: at,

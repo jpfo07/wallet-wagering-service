@@ -1,6 +1,7 @@
 import { ExponentialBackoff } from "../../domain/shared/backoff-policy.ts";
 import type { Application } from "../application/composition.ts";
 import type { PendingReferenceWorkerConfig } from "../config/env.ts";
+import { logContext } from "../observability/log-context.ts";
 import { PollingLoop } from "./polling-loop.ts";
 
 export interface RunningPendingReferenceWorker {
@@ -25,14 +26,18 @@ export function startPendingReferenceWorker(setup: {
       let progressed = false;
       for (const candidate of candidates) {
         if (signal.aborted) break;
+        const fields = {
+          correlationId: candidate.correlationId,
+          transactionId: candidate.transactionId,
+          walletId: candidate.walletId,
+        };
         try {
-          await recheck.recheck(candidate);
+          await logContext.run(fields, () => recheck.recheck(candidate));
           progressed = true;
         } catch (error) {
           // Transient (after the runner's retries) or unexpected: untouched, back in a later cycle.
           logger.warn("pending reference re-check failed, will retry", {
-            transactionId: candidate.transactionId,
-            walletId: candidate.walletId,
+            ...fields,
             error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
           });
         }

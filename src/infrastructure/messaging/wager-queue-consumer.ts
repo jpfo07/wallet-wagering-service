@@ -5,10 +5,12 @@ import {
   SendMessageCommand,
 } from "@aws-sdk/client-sqs";
 import type { Message, SQSClient } from "@aws-sdk/client-sqs";
+import type { ProviderPrincipal } from "../../application/ports/provider-identity.ts";
 import type { RandomSource } from "../../application/ports/system.ts";
 import type { LogFields, Logger } from "../../application/ports/telemetry.ts";
 import type { ProcessWagerTransaction } from "../../application/wager/process-wager-transaction.ts";
 import type { ExponentialBackoff } from "../../domain/shared/backoff-policy.ts";
+import { logContext } from "../observability/log-context.ts";
 import { isAcceptableCorrelationId } from "../validation/wager-schemas.ts";
 import { abortableSleep } from "./abortable-sleep.ts";
 import type { DatabaseGate } from "./database-gate.ts";
@@ -26,6 +28,8 @@ export const WAGER_CONSUMER_NAME = "wager-transactions-consumer";
 const MAX_BATCH = 10;
 const MAX_VISIBILITY_SECONDS = 43_200;
 const DLQ_ATTRIBUTE_MAX_LENGTH = 1_000;
+
+const INTERNAL_CHANNEL: ProviderPrincipal = { kind: "internal-channel" };
 
 export interface ConsumerMetrics {
   received(count: number): void;
@@ -257,10 +261,21 @@ export class WagerQueueConsumer {
     };
     let decision: DeliveryDecision;
     try {
-      const result = await this.deps.processWager.execute(
-        envelope.data,
-        { correlationId, causationId: envelope.messageId },
-        { consumerName: this.options.consumerName, messageId: envelope.messageId },
+      // Logs written while processing (use case, transient retries) carry the message's ids.
+      const result = await logContext.run(
+        {
+          correlationId,
+          messageId: envelope.messageId,
+          walletId: envelope.data.walletId,
+          providerId: envelope.data.providerId,
+        },
+        () =>
+          this.deps.processWager.execute(
+            envelope.data,
+            // The queue is a trusted internal channel: no provider credentials to check.
+            { correlationId, causationId: envelope.messageId, principal: INTERNAL_CHANNEL },
+            { consumerName: this.options.consumerName, messageId: envelope.messageId },
+          ),
       );
       this.deps.gate.markHealthy();
       decision = decideForResult(result);

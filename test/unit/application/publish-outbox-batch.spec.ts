@@ -12,10 +12,7 @@ import type { TransactionScope, UnitOfWork } from "../../../src/application/port
 import { TransactionRunner } from "../../../src/application/transaction-runner.ts";
 import { OutboxMessage } from "../../../src/domain/messaging/outbox-message.ts";
 import { ExponentialBackoff } from "../../../src/domain/shared/backoff-policy.ts";
-import {
-  InMemoryApplicationMetrics,
-  SilentLogger,
-} from "../../../src/infrastructure/observability/telemetry-adapters.ts";
+import { InMemoryApplicationMetrics, SilentLogger } from "../../support/in-memory-telemetry.ts";
 import { RecordingSleeper } from "../../support/application-suite.ts";
 
 const T0 = new Date("2026-10-25T12:00:00.000Z");

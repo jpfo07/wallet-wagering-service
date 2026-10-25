@@ -31,6 +31,7 @@ export const WagerTransactionRecord = defineEntity({
     referenceAttempts: p.integer(),
     nextReferenceCheckAt: p.datetime(3).nullable(),
     referenceExpiresAt: p.datetime(3).nullable(),
+    correlationId: p.string().length(128).nullable(),
     createdAt: p.datetime(3),
     updatedAt: p.datetime(3),
   },

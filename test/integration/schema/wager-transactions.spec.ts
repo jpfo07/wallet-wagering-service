@@ -361,6 +361,7 @@ describe("wager_transactions: terminal and business fields are immutable", () =>
     ["amount", "amount = 99.00"],
     ["idempotency_key", "idempotency_key = 'other'"],
     ["kind", "kind = 'ROLLBACK'"],
+    ["correlation_id", "correlation_id = 'rewritten'"],
   ])("business field %s of a PENDING_REFERENCE transaction", async (_label, assignment) => {
     const { sql } = suite();
     const pending = pendingReferenceRow(walletId);

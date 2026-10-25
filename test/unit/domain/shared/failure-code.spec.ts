@@ -45,6 +45,8 @@ describe("code taxonomy", () => {
       "EXTERNAL_TRANSACTION_ID_CONFLICT",
       "WALLET_ALREADY_EXISTS",
       "TRANSIENT_FAILURE",
+      "UNAUTHENTICATED",
+      "PROVIDER_IDENTITY_MISMATCH",
     ]);
   });
 

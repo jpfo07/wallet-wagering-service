@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { ExponentialBackoff } from "../../../src/domain/shared/backoff-policy.ts";
 import { shutdownTimeoutMs } from "../../../src/entrypoints/run-worker.ts";
 import { ConfigError, loadConfig } from "../../../src/infrastructure/config/env.ts";
-import { SilentLogger } from "../../../src/infrastructure/observability/telemetry-adapters.ts";
+import { SilentLogger } from "../../support/in-memory-telemetry.ts";
 import { PollingLoop } from "../../../src/infrastructure/workers/polling-loop.ts";
 import type { PollingTask } from "../../../src/infrastructure/workers/polling-loop.ts";
 import { assertOutboxTimeouts } from "../../../src/infrastructure/workers/start-outbox-publisher.ts";

@@ -14,10 +14,7 @@ import { Money } from "../../../src/domain/shared/money.ts";
 import { WagerTransactionKind } from "../../../src/domain/wager/wager-transaction-kind.ts";
 import { WagerTransactionStatus } from "../../../src/domain/wager/wager-transaction-status.ts";
 import { WagerTransaction } from "../../../src/domain/wager/wager-transaction.ts";
-import {
-  InMemoryApplicationMetrics,
-  SilentLogger,
-} from "../../../src/infrastructure/observability/telemetry-adapters.ts";
+import { InMemoryApplicationMetrics, SilentLogger } from "../../support/in-memory-telemetry.ts";
 import { MikroOrmUnitOfWork } from "../../../src/infrastructure/persistence/mikro-orm-unit-of-work.ts";
 import { MathRandomSource } from "../../../src/infrastructure/system/system-adapters.ts";
 import { RecordingSleeper, useApplicationSuite } from "../../support/application-suite.ts";

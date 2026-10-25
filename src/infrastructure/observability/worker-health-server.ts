@@ -1,3 +1,4 @@
+import type { Registry } from "prom-client";
 import type { ReadinessReport } from "./readiness.ts";
 
 export interface WorkerHealthServer {
@@ -7,13 +8,14 @@ export interface WorkerHealthServer {
 
 /**
  * Tiny internal HTTP server for workers, which have no Nest HTTP layer:
- * `/health/live` (process responsive) and `/health/ready` (dependencies reachable).
- * `/metrics` joins in Phase 7.
+ * `/health/live` (process responsive), `/health/ready` (dependencies reachable) and `/metrics`
+ * (Prometheus exposition of the process).
  */
 export function startWorkerHealthServer(options: {
   readonly port: number;
   readonly processName: string;
   readonly instanceId: string;
+  readonly metrics: Registry;
   readonly readiness: () => Promise<ReadinessReport>;
 }): WorkerHealthServer {
   const server = Bun.serve({
@@ -34,6 +36,11 @@ export function startWorkerHealthServer(options: {
           { status: report.ready ? "ok" : "unavailable", checks: report.checks },
           { status: report.ready ? 200 : 503 },
         );
+      }
+      if (pathname === "/metrics") {
+        return new Response(await options.metrics.metrics(), {
+          headers: { "content-type": options.metrics.contentType },
+        });
       }
       return new Response("not found", { status: 404 });
     },

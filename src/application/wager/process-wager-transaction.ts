@@ -20,8 +20,14 @@ import {
   PoisonMessageError,
   WalletNotFoundError,
 } from "../errors.ts";
+import { assertActsAsProvider } from "../ports/provider-identity.ts";
 import type { Clock, IdGenerator, RandomSource } from "../ports/system.ts";
-import type { ApplicationMetrics, Logger } from "../ports/telemetry.ts";
+import type {
+  ApplicationMetrics,
+  DuplicateType,
+  Logger,
+  TransactionSource,
+} from "../ports/telemetry.ts";
 import type { TransactionScope } from "../ports/unit-of-work.ts";
 import type { RequestContext } from "../request-context.ts";
 import type { TransactionRunner } from "../transaction-runner.ts";
@@ -68,6 +74,8 @@ interface PreparedCommand {
 interface Attempt {
   readonly result: WagerTransactionResult;
   readonly walletId: string;
+  /** Reported once, after the attempt that counted (a retried attempt reports nothing). */
+  readonly duplicate?: DuplicateType;
 }
 
 /**
@@ -96,7 +104,41 @@ export class ProcessWagerTransaction {
     context: RequestContext,
     delivery?: InboxDelivery,
   ): Promise<WagerTransactionResult> {
-    const prepared = this.prepare(command, delivery);
+    const source: TransactionSource = delivery === undefined ? "http" : "sqs";
+    const kind = isWagerTransactionKind(command.kind) ? command.kind : "INVALID";
+    // Monotonic time, observability only: never stored, never part of a decision.
+    const startedAt = performance.now();
+    let outcome = "ERROR";
+    try {
+      const result = await this.process(command, context, delivery, source);
+      outcome = result.idempotentReplay ? "REPLAY" : result.status;
+      return result;
+    } catch (error) {
+      if (error instanceof PoisonMessageError) this.metrics.duplicateDetected("poison");
+      if (error instanceof IdempotencyConflictError) {
+        this.metrics.duplicateDetected("idempotency_conflict");
+      }
+      if (error instanceof Error && "code" in error && typeof error.code === "string") {
+        outcome = error.code;
+      }
+      throw error;
+    } finally {
+      this.metrics.wagerProcessed({
+        kind,
+        source,
+        outcome,
+        durationSeconds: (performance.now() - startedAt) / 1000,
+      });
+    }
+  }
+
+  private async process(
+    command: WagerTransactionCommand,
+    context: RequestContext,
+    delivery: InboxDelivery | undefined,
+    source: TransactionSource,
+  ): Promise<WagerTransactionResult> {
+    const prepared = this.prepare(command, context, delivery);
     const work = (scope: TransactionScope): Promise<Attempt> =>
       this.attempt(scope, prepared, context);
     let attempt: Attempt;
@@ -124,11 +166,19 @@ export class ProcessWagerTransaction {
       correlationId: context.correlationId,
       messageId: delivery?.messageId,
     });
+    if (attempt.duplicate !== undefined) this.metrics.duplicateDetected(attempt.duplicate);
+    if (!attempt.result.idempotentReplay) {
+      this.metrics.wagerTransactionDecided(prepared.fields.kind, attempt.result.status, source);
+    }
     return attempt.result;
   }
 
   /** Validation before any SQL: malformed input never opens a transaction. */
-  private prepare(command: WagerTransactionCommand, delivery?: InboxDelivery): PreparedCommand {
+  private prepare(
+    command: WagerTransactionCommand,
+    context: RequestContext,
+    delivery?: InboxDelivery,
+  ): PreparedCommand {
     const kind = command.kind;
     if (!isWagerTransactionKind(kind)) {
       throw new InvalidWagerTransactionError(ErrorCode.InvalidPayload, "unknown kind");
@@ -147,6 +197,8 @@ export class ProcessWagerTransaction {
         command.referenceExternalTransactionId,
       ),
     };
+    // Authorization after the shape check (a valid providerId) and before any SQL.
+    assertActsAsProvider(context.principal, fields.providerId);
     const idempotencyKey = requireText("idempotencyKey", command.idempotencyKey);
     const payloadHash = computeWagerPayloadHash(fields);
     const transactionId = this.ids.next();
@@ -184,7 +236,9 @@ export class ProcessWagerTransaction {
     const { fields, idempotencyKey, payloadHash } = prepared;
 
     // 1. Lock the wallet: the first statement of the transaction.
+    const lockStartedAt = performance.now();
     const wallet = await scope.wallets.lockById(fields.walletId);
+    this.metrics.walletLockWait((performance.now() - lockStartedAt) / 1000);
     if (wallet === undefined) throw new WalletNotFoundError(fields.walletId);
     const at = this.clock.now();
 
@@ -218,15 +272,18 @@ export class ProcessWagerTransaction {
       incoming: { providerId: fields.providerId, idempotencyKey, payloadHash },
     });
     if (decision.type === "CONFLICT") {
-      this.metrics.idempotencyConflict();
       throw new IdempotencyConflictError(decision.code, decision.transaction.id);
     }
     if (decision.type === "REPLAY") {
-      this.metrics.idempotentReplay();
       await this.markInbox(scope, inboxToMark, at);
       return {
         result: wagerTransactionResult(decision.transaction, true),
         walletId: wallet.id,
+        // Same messageId already in the inbox: an SQS redelivery; otherwise a provider retry.
+        duplicate:
+          prepared.delivery !== undefined && inboxToMark === undefined
+            ? "inbox_redelivery"
+            : "replay",
       };
     }
 
@@ -236,6 +293,7 @@ export class ProcessWagerTransaction {
       id: prepared.transactionId,
       idempotencyKey,
       payloadHash,
+      correlationId: context.correlationId,
       createdAt: at,
     });
     const versionRead = wallet.version;

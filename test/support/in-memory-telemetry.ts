@@ -1,36 +1,13 @@
-import type { ApplicationMetrics, LogFields, Logger } from "../../application/ports/telemetry.ts";
-import type { DeliveryDecision } from "../messaging/delivery-decision.ts";
-import type { ConsumerMetrics } from "../messaging/wager-queue-consumer.ts";
-
-type Level = "info" | "warn" | "error";
-
-/** One JSON object per line on stdout. Replaced by pino in the observability phase. */
-export class JsonLineLogger implements Logger {
-  constructor(private readonly base: LogFields = {}) {}
-
-  info(message: string, fields?: LogFields): void {
-    this.write("info", message, fields);
-  }
-
-  warn(message: string, fields?: LogFields): void {
-    this.write("warn", message, fields);
-  }
-
-  error(message: string, fields?: LogFields): void {
-    this.write("error", message, fields);
-  }
-
-  private write(level: Level, message: string, fields: LogFields = {}): void {
-    const line = JSON.stringify({
-      level,
-      time: new Date().toISOString(),
-      msg: message,
-      ...this.base,
-      ...fields,
-    });
-    process.stdout.write(`${line}\n`);
-  }
-}
+import type {
+  ApplicationMetrics,
+  DuplicateType,
+  LockConflict,
+  Logger,
+  TransactionSource,
+  WagerProcessingObservation,
+} from "../../src/application/ports/telemetry.ts";
+import type { DeliveryDecision } from "../../src/infrastructure/messaging/delivery-decision.ts";
+import type { ConsumerMetrics } from "../../src/infrastructure/messaging/wager-queue-consumer.ts";
 
 export class SilentLogger implements Logger {
   info(): void {}
@@ -40,8 +17,11 @@ export class SilentLogger implements Logger {
 
 export type ApplicationMetricName =
   | "transient_retry"
-  | "idempotent_replay"
-  | "idempotency_conflict"
+  | "lock_conflict"
+  | "wallet_lock_wait"
+  | "duplicate"
+  | "wager_transaction"
+  | "wager_processed"
   | "reconciliation_divergence"
   | "outbox_published"
   | "outbox_publish_failed"
@@ -50,8 +30,8 @@ export type ApplicationMetricName =
 export type ApplicationGaugeName = "outbox_oldest_pending_age_ms" | "outbox_pending";
 
 /**
- * Process-local counters. They are observability only, never a correctness mechanism; the
- * Prometheus exporter (/metrics) reads the same counters in the observability phase.
+ * Test double of the metrics ports: plain counters that a test can read back with `count()`.
+ * Production uses the Prometheus adapters (prometheus-metrics.ts).
  */
 export class InMemoryApplicationMetrics implements ApplicationMetrics {
   private readonly counters = new Map<string, number>();
@@ -61,12 +41,29 @@ export class InMemoryApplicationMetrics implements ApplicationMetrics {
     this.increment("transient_retry");
   }
 
-  idempotentReplay(): void {
-    this.increment("idempotent_replay");
+  lockConflict(conflict: LockConflict): void {
+    this.increment(`lock_conflict{reason=${conflict}}`);
+    this.increment("lock_conflict");
   }
 
-  idempotencyConflict(): void {
-    this.increment("idempotency_conflict");
+  walletLockWait(): void {
+    this.increment("wallet_lock_wait");
+  }
+
+  duplicateDetected(type: DuplicateType): void {
+    this.increment(`duplicate{type=${type}}`);
+    this.increment("duplicate");
+  }
+
+  wagerTransactionDecided(kind: string, status: string, source: TransactionSource): void {
+    this.increment(`wager_transaction{kind=${kind},status=${status},source=${source}}`);
+    this.increment(`wager_transaction{status=${status}}`);
+    this.increment("wager_transaction");
+  }
+
+  wagerProcessed(observation: WagerProcessingObservation): void {
+    this.increment(`wager_processed{outcome=${observation.outcome}}`);
+    this.increment("wager_processed");
   }
 
   reconciliationDivergence(): void {
@@ -107,7 +104,7 @@ export class InMemoryApplicationMetrics implements ApplicationMetrics {
   }
 }
 
-/** Process-local counters of the SQS consumer (Prometheus in the observability phase). */
+/** Test double of the consumer metrics. */
 export class InMemoryConsumerMetrics implements ConsumerMetrics {
   private readonly counters = new Map<string, number>();
 

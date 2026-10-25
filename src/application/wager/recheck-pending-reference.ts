@@ -23,6 +23,12 @@ export type RecheckOutcome =
   | WagerTransactionStatus.Failed
   | "SKIPPED";
 
+/** What a handled candidate reports: its outcome and, once read under the lock, the transaction. */
+interface Checked {
+  readonly outcome: RecheckOutcome;
+  readonly transaction?: WagerTransaction;
+}
+
 interface Locked {
   readonly wallet: Wallet;
   readonly transaction: WagerTransaction;
@@ -64,9 +70,9 @@ export class RecheckPendingReferences {
    * refusal) makes it FAILED (INTERNAL_PERMANENT_ERROR), otherwise it would come back forever.
    */
   async recheck(candidate: PendingReferenceCandidate): Promise<RecheckOutcome> {
-    let outcome: RecheckOutcome;
+    let checked: Checked;
     try {
-      outcome = await this.runner.run((scope) => this.attempt(scope, candidate));
+      checked = await this.runner.run((scope) => this.attempt(scope, candidate));
     } catch (error) {
       if (!(error instanceof DomainError || error instanceof PersistenceIntegrityError)) {
         throw error;
@@ -76,13 +82,21 @@ export class RecheckPendingReferences {
         walletId: candidate.walletId,
         error: error.message,
       });
-      outcome = await this.runner.run((scope) => this.failPermanently(scope, candidate));
+      checked = await this.runner.run((scope) => this.failPermanently(scope, candidate));
     }
+    const { outcome, transaction } = checked;
     this.metrics.pendingReferenceChecked(outcome);
-    if (outcome !== WagerTransactionStatus.PendingReference && outcome !== "SKIPPED") {
+    if (
+      transaction !== undefined &&
+      outcome !== WagerTransactionStatus.PendingReference &&
+      outcome !== "SKIPPED"
+    ) {
+      this.metrics.wagerTransactionDecided(transaction.kind, outcome, "pending_worker");
       this.logger.info("pending reference resolved", {
         transactionId: candidate.transactionId,
         walletId: candidate.walletId,
+        providerId: transaction.providerId,
+        correlationId: transaction.correlationId,
         status: outcome,
       });
     }
@@ -92,9 +106,9 @@ export class RecheckPendingReferences {
   private async attempt(
     scope: TransactionScope,
     candidate: PendingReferenceCandidate,
-  ): Promise<RecheckOutcome> {
+  ): Promise<Checked> {
     const locked = await this.lockAndReread(scope, candidate);
-    if (locked === undefined) return "SKIPPED";
+    if (locked === undefined) return { outcome: "SKIPPED" };
     const { wallet, transaction, at } = locked;
     const attemptsRead = transaction.referenceAttempts;
     const versionRead = wallet.version;
@@ -120,15 +134,15 @@ export class RecheckPendingReferences {
     await scope.outbox.enqueue(events.map((event) => OutboxMessage.enqueue(event)));
     // A resolved REFUND may be what a ROLLBACK waits for.
     await expediteWaitingDependents(scope.transactions, transaction, at);
-    return outcome.status;
+    return { outcome: outcome.status, transaction };
   }
 
   private async failPermanently(
     scope: TransactionScope,
     candidate: PendingReferenceCandidate,
-  ): Promise<RecheckOutcome> {
+  ): Promise<Checked> {
     const locked = await this.lockAndReread(scope, candidate, { evenIfNotDue: true });
-    if (locked === undefined) return "SKIPPED";
+    if (locked === undefined) return { outcome: "SKIPPED" };
     const { transaction, at } = locked;
     const attemptsRead = transaction.referenceAttempts;
     transaction.fail({ code: FailureCode.InternalPermanentError, at });
@@ -139,7 +153,7 @@ export class RecheckPendingReferences {
       ),
     ]);
     await expediteWaitingDependents(scope.transactions, transaction, at);
-    return WagerTransactionStatus.Failed;
+    return { outcome: WagerTransactionStatus.Failed, transaction };
   }
 
   /** Wallet lock first (the first statement), then the transaction read again under it. */
@@ -148,7 +162,9 @@ export class RecheckPendingReferences {
     candidate: PendingReferenceCandidate,
     options: { readonly evenIfNotDue?: boolean } = {},
   ): Promise<Locked | undefined> {
+    const lockStartedAt = performance.now();
     const wallet = await scope.wallets.lockById(candidate.walletId);
+    this.metrics.walletLockWait((performance.now() - lockStartedAt) / 1000);
     if (wallet === undefined) {
       // A transaction always has its wallet (FK) and wallets are never deleted (trigger).
       throw new PersistenceIntegrityError("23503", "wager_transactions_wallet_fk", undefined);
@@ -166,9 +182,15 @@ export class RecheckPendingReferences {
     return { wallet, transaction, at };
   }
 
-  /** The original correlationId is not stored; a new one per check, caused by the transaction. */
+  /**
+   * The events keep the correlationId of the request that created the transaction; only rows
+   * written before it was stored get a fresh one. The cause is the transaction itself.
+   */
   private context(transaction: WagerTransaction): { correlationId: string; causationId: string } {
-    return { correlationId: this.ids.next(), causationId: transaction.id };
+    return {
+      correlationId: transaction.correlationId ?? this.ids.next(),
+      causationId: transaction.id,
+    };
   }
 
   private eventContext(

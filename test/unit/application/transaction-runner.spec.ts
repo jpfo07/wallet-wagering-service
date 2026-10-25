@@ -7,10 +7,7 @@ import {
 import type { TransactionScope, UnitOfWork } from "../../../src/application/ports/unit-of-work.ts";
 import { TransactionRunner } from "../../../src/application/transaction-runner.ts";
 import { ExponentialBackoff } from "../../../src/domain/shared/backoff-policy.ts";
-import {
-  InMemoryApplicationMetrics,
-  SilentLogger,
-} from "../../../src/infrastructure/observability/telemetry-adapters.ts";
+import { InMemoryApplicationMetrics, SilentLogger } from "../../support/in-memory-telemetry.ts";
 import { RecordingSleeper } from "../../support/application-suite.ts";
 
 /** Scripted unit of work: each attempt throws the next scripted error, or succeeds when exhausted. */

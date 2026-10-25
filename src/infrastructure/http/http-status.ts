@@ -4,6 +4,8 @@ import { WagerTransactionStatus } from "../../domain/wager/wager-transaction-sta
 
 const STATUS_BY_CATEGORY: Readonly<Record<CodeCategory, number>> = Object.freeze({
   [CodeCategory.InvalidPayload]: 400,
+  [CodeCategory.Unauthenticated]: 401,
+  [CodeCategory.Forbidden]: 403,
   [CodeCategory.NotFound]: 404,
   [CodeCategory.Conflict]: 409,
   [CodeCategory.BusinessRejection]: 422,

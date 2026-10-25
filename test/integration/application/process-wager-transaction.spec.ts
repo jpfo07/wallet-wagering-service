@@ -370,7 +370,7 @@ describe("ProcessWagerTransaction (real PostgreSQL)", () => {
       expect(await walletState(sql, wallet.id)).toEqual({ balance: "85.00", version: 3 });
       expect(await transactionRows(sql, wallet.id)).toEqual(rowsBefore);
       expect(await outboxEventTypes(sql, wallet.id)).toEqual(eventsBefore);
-      expect(suite().metrics.count("idempotent_replay")).toBeGreaterThan(0);
+      expect(suite().metrics.count("duplicate{type=replay}")).toBeGreaterThan(0);
       await assertLedgerInvariant(sql, wallet.id);
     });
 

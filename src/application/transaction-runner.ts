@@ -1,6 +1,7 @@
 import type { ExponentialBackoff } from "../domain/shared/backoff-policy.ts";
 import { TransientFailureError, TransientPersistenceError } from "./errors.ts";
 import type { RandomSource, Sleeper } from "./ports/system.ts";
+import { lockConflictOf } from "./ports/telemetry.ts";
 import type { ApplicationMetrics, Logger } from "./ports/telemetry.ts";
 import type { TransactionScope, UnitOfWork, UnitOfWorkOptions } from "./ports/unit-of-work.ts";
 
@@ -36,6 +37,8 @@ export class TransactionRunner {
         return await this.unitOfWork.run(work, options);
       } catch (error) {
         if (!(error instanceof TransientPersistenceError)) throw error;
+        const conflict = lockConflictOf(error.reason);
+        if (conflict !== undefined) this.metrics.lockConflict(conflict);
         if (attempt >= this.policy.maxAttempts) {
           throw new TransientFailureError(attempt, error);
         }

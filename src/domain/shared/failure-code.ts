@@ -36,6 +36,8 @@ export enum ErrorCode {
   ExternalTransactionIdConflict = "EXTERNAL_TRANSACTION_ID_CONFLICT",
   WalletAlreadyExists = "WALLET_ALREADY_EXISTS",
   TransientFailure = "TRANSIENT_FAILURE",
+  Unauthenticated = "UNAUTHENTICATED",
+  ProviderIdentityMismatch = "PROVIDER_IDENTITY_MISMATCH",
 }
 
 /** Transport adapters map categories (never individual codes) to HTTP status / SQS handling. */
@@ -46,6 +48,10 @@ export enum CodeCategory {
   NotFound = "NOT_FOUND",
   Conflict = "CONFLICT",
   Transient = "TRANSIENT",
+  /** No valid provider credentials (only once a real identity adapter is plugged in). */
+  Unauthenticated = "UNAUTHENTICATED",
+  /** Authenticated, but acting on behalf of another provider. */
+  Forbidden = "FORBIDDEN",
 }
 
 /**
@@ -125,6 +131,14 @@ export const ERROR_CODE_CATALOG: Readonly<Record<ErrorCode, CodeDescriptor>> = O
   [ErrorCode.TransientFailure]: {
     category: CodeCategory.Transient,
     providerAction: ProviderAction.Retry,
+  },
+  [ErrorCode.Unauthenticated]: {
+    category: CodeCategory.Unauthenticated,
+    providerAction: ProviderAction.Fix,
+  },
+  [ErrorCode.ProviderIdentityMismatch]: {
+    category: CodeCategory.Forbidden,
+    providerAction: ProviderAction.Fix,
   },
 });
 

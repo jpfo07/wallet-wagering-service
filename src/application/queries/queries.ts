@@ -3,6 +3,8 @@ import type { TransactionRunner } from "../transaction-runner.ts";
 import { requirePositiveInteger, requireText, requireUuid } from "../validation.ts";
 import { ledgerEntryView, transactionView, walletView } from "../views.ts";
 import type { LedgerEntryView, TransactionView, WalletView } from "../views.ts";
+import { assertActsAsProvider } from "../ports/provider-identity.ts";
+import type { ProviderPrincipal } from "../ports/provider-identity.ts";
 
 export const MAX_LEDGER_PAGE_LIMIT = 200;
 
@@ -82,8 +84,13 @@ export class GetTransaction {
 export class GetTransactionByExternalId {
   constructor(private readonly runner: TransactionRunner) {}
 
-  async execute(providerId: string, externalTransactionId: string): Promise<TransactionView> {
+  async execute(
+    providerId: string,
+    externalTransactionId: string,
+    principal?: ProviderPrincipal,
+  ): Promise<TransactionView> {
     const provider = requireText("providerId", providerId);
+    assertActsAsProvider(principal, provider);
     const externalId = requireText("externalTransactionId", externalTransactionId);
     const transaction = await this.runner.run(
       (scope) => scope.transactions.findByExternalId(provider, externalId),

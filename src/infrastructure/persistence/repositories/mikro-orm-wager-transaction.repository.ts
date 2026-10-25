@@ -69,13 +69,17 @@ export class MikroOrmWagerTransactionRepository implements WagerTransactionRepos
       WagerTransactionRecord,
       { status: WagerTransactionStatus.PendingReference, nextReferenceCheckAt: { $lte: now } },
       {
-        fields: ["id", "walletId"],
+        fields: ["id", "walletId", "correlationId"],
         orderBy: { nextReferenceCheckAt: "asc", id: "asc" },
         limit,
         disableIdentityMap: true,
       },
     );
-    return rows.map((row) => ({ transactionId: row.id, walletId: row.walletId }));
+    return rows.map((row) => ({
+      transactionId: row.id,
+      walletId: row.walletId,
+      correlationId: row.correlationId ?? undefined,
+    }));
   }
 
   async updatePending(

@@ -63,6 +63,7 @@ export class CreateWallet {
           playerId,
           money: initialBalance,
           at,
+          correlationId: context.correlationId,
         });
         await scope.transactions.insert(transaction);
         const eventContext = (): EventContext => ({

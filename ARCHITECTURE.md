@@ -472,6 +472,8 @@ Códigos que não viram transação persistida (`ErrorCode`):
 | `IDEMPOTENCY_KEY_REUSED`, `EXTERNAL_TRANSACTION_ID_CONFLICT`                                                                                                      | CONFLICT        | FIX     |
 | `WALLET_ALREADY_EXISTS`                                                                                                                                           | CONFLICT        | GIVE_UP |
 | `TRANSIENT_FAILURE`                                                                                                                                               | TRANSIENT       | RETRY   |
+| `UNAUTHENTICATED`                                                                                                                                                 | UNAUTHENTICATED | FIX     |
+| `PROVIDER_IDENTITY_MISMATCH`                                                                                                                                      | FORBIDDEN       | FIX     |
 
 PENDING_REFERENCE não é falha: o provedor pode consultar a transação ou reenviar a mesma requisição.
 
@@ -739,7 +741,7 @@ composição usada pelos testes) e o `ApplicationModule` só expõe essas instâ
 | `UnitOfWork.run(work)`: **uma** transação SQL, READ COMMITTED | `MikroOrmUnitOfWork`: `orm.em.fork()` novo por tentativa + `em.transactional` |
 | `WalletRepository`, `WagerTransactionRepository`              | `MikroOrm*Repository`, presos à transação                                     |
 | `LedgerRepository`, `InboxRepository`, `OutboxRepository`     | idem                                                                          |
-| `Logger`, `ApplicationMetrics`                                | `JsonLineLogger` e contadores em memória (pino/Prometheus na Fase 7)          |
+| `Logger`, `ApplicationMetrics`                                | `PinoLogger` e `PrometheusApplicationMetrics` (seção 14)                      |
 
 Os repositórios usam só operações nativas (`findOne` com `disableIdentityMap`, `insert`,
 `nativeUpdate`, `INSERT … ON CONFLICT DO NOTHING`). O flush automático do Unit of Work não é usado: a
@@ -845,7 +847,7 @@ quem não quer a OPENING filtra pelo `kind`. Com saldo zero não há evento.
   `idempotencyKey`). Mesmo `messageId` com outra chave também é mensagem envenenada.
 - **Replay de FAILED** não traz `balance` (FAILED não guarda saldo observado).
 - **`correlationId` e `causationId`** (o `messageId` no SQS) entram no comando e vão para os eventos;
-  a propagação ponta a ponta é da Fase 7.
+  o `correlationId` também fica gravado na transação (seção 14).
 - **UUIDs normalizados para minúsculas** na entrada (revisto na Fase 4; antes eram recusados). Ver
   seção 11.
 
@@ -863,7 +865,6 @@ quem não quer a OPENING filtra pelo `kind`. Com saldo zero não há evento.
 
 ### Limitações e próximos passos
 
-- Métricas em memória por processo e logger JSON simples até a Fase 7 (pino + `/metrics`).
 - **VisibilityTimeout × pior caso de processamento:** resolvido na Fase 5 (60 s, validado no boot do
   consumidor). Ver seção 12.
 
@@ -914,6 +915,8 @@ Um filtro global (`ApiExceptionFilter` + `mapError`) traduz pela **categoria** d
 | Transação PROCESSED (nova ou replay)                                                  | 200 (201 na criação de wallet)          |
 | PENDING_REFERENCE (nova ou replay)                                                    | 202                                     |
 | Forma inválida, `ValidationError` do domínio, JSON malformado, header, cursor/limit   | 400                                     |
+| `UNAUTHENTICATED` (só com um adaptador de identidade real, seção 15)                  | 401                                     |
+| `PROVIDER_IDENTITY_MISMATCH` (provedor autenticado ≠ `providerId` do pedido)          | 403                                     |
 | `WALLET_NOT_FOUND`, `TRANSACTION_NOT_FOUND`, rota inexistente (`ROUTE_NOT_FOUND`)     | 404                                     |
 | `IDEMPOTENCY_KEY_REUSED`, `EXTERNAL_TRANSACTION_ID_CONFLICT`, `WALLET_ALREADY_EXISTS` | 409                                     |
 | REJECTED (rejeição de negócio, com `failureCode`)                                     | 422                                     |
@@ -1138,7 +1141,6 @@ Todos terminam com `assertLedgerInvariant`.
 
 ### Limitações e próximos passos
 
-- Métricas do consumidor em memória por processo até a Fase 7 (Prometheus).
 - `WaitTimeSeconds` de 5 s faz mais polls vazios que 20 s (12 por minuto por processo, ocioso). É o
   preço de um desligamento rápido sem abortar o poll.
 - Mensagens que o SQS entregar numa receive cuja conexão caiu (rede, não SIGTERM) só voltam depois do
@@ -1251,8 +1253,9 @@ uma leitura.
 
 - **Eventos:** reprocessamento que continua esperando não gera evento (`PendingReference` só na
   primeira vez); resolvida → `Processed` (+ `BalanceChanged`); expirada/rejeitada → `Rejected`.
-  `correlationId` novo por verificação e `causationId = transactionId`, porque a transação não guarda
-  o `correlationId` original (a propagação ponta a ponta é da Fase 7).
+  Os eventos levam o `correlationId` da requisição que criou a transação (gravado em
+  `wager_transactions.correlation_id`, seção 14) e `causationId = transactionId`. Só linhas anteriores
+  à coluna recebem um id novo.
 - **Erro permanente** da transação (invariante do domínio, recusa de integridade do banco) → nova
   transação com o mesmo protocolo de lock, `fail(INTERNAL_PERMANENT_ERROR)` + `WagerTransactionFailed`
   (decisão 13). Sem isso o candidato voltaria em todo ciclo. Transitório esgotado → fica como está e
@@ -1297,13 +1300,18 @@ candidato em andamento e deixa o resto do lote para outra réplica. O prazo do p
 worker = `tentativas × (lock_timeout + backoff)` + 4 s ≈ 20 s, daí o `stop_grace_period` de 25 s no
 compose. Matar antes disso continua seguro (tabela acima).
 
-### Métricas (em memória até a Fase 7)
+### Métricas
 
-- `outbox_published`, `outbox_publish_failed{reason}`.
-- **Outbox lag**, amostrado a cada 1 s pelo publisher: `outbox_oldest_pending_age_ms` (agora −
-  `occurred_at` do pendente mais antigo; aqui milissegundos de skew não importam) e `outbox_pending`
-  (quantidade). Um SQL no índice parcial.
-- `pending_reference_checked{outcome}` (PROCESSED, REJECTED, FAILED, PENDING_REFERENCE, SKIPPED).
+Expostas no `/metrics` de cada worker (seção 14):
+
+- `wws_outbox_published_total` e `wws_outbox_publish_failed_total{reason}`.
+- **Outbox lag**, amostrado a cada 1 s pelo publisher. São dois gauges, lidos com um SQL no índice
+  parcial:
+  - `wws_outbox_oldest_pending_age_seconds`: agora − `occurred_at` do pendente mais antigo. Aqui
+    milissegundos de skew não importam.
+  - `wws_outbox_pending`: quantidade de pendentes.
+- `wws_pending_reference_checks_total{outcome}`, com os desfechos PROCESSED, REJECTED, FAILED,
+  PENDING_REFERENCE e SKIPPED.
 
 ### Testes
 
@@ -1347,4 +1355,201 @@ Todos terminam com `assertLedgerInvariant`.
 - **Retenção:** outbox publicada e transações resolvidas crescem sem limpeza (como a inbox).
 - **Throughput por wallet** limitado por lote (`OUTBOX_MAX_EVENTS_PER_AGGREGATE` camadas
   sequenciais); a medir no teste de carga.
-- Métricas em memória por processo até a Fase 7 (Prometheus).
+
+---
+
+## 14. Observabilidade
+
+Os quatro processos (API, `sqs-consumer`, `outbox-publisher` e `pending-reference-worker`) usam o
+mesmo `ObservabilityModule.forProcess(nome)`. Cada processo tem um logger pino e um registry
+Prometheus próprios.
+
+### Logs (pino, JSON por linha)
+
+- **Formato:** cada linha é um objeto JSON com `level` (rótulo), `time` (ISO), `process`,
+  `instanceId` e `msg`. Em seguida vêm os identificadores do contexto e os campos de quem chamou.
+- **Boot:** o log do boot (`boot-log.ts`), escrito antes de o pino carregar, tem o mesmo formato.
+  O pino só carrega depois que o handler de sinal existe (seção 6).
+- **Logs do Nest:** as mensagens do próprio Nest (mapeamento de rotas, erros do framework) passam pelo
+  `NestLoggerAdapter`. Nenhuma linha sai fora do JSON. O teste do entrypoint faz `JSON.parse` de todo
+  o stdout.
+- **Saída:** stdout síncrono. Uma linha escrita antes de um crash não se perde no buffer.
+
+**Campos obrigatórios sem passar de mão em mão.** Um `AsyncLocalStorage` (`log-context.ts`) guarda
+`correlationId`, `messageId`, `transactionId`, `walletId` e `providerId` da unidade de trabalho em
+curso. O `mixin` do pino junta esses campos a toda linha, e o campo explícito de quem chamou vence.
+
+| Onde o contexto é aberto                            | Campos                                                 |
+| --------------------------------------------------- | ------------------------------------------------------ |
+| `LogContextInterceptor` (HTTP, em volta do handler) | `correlationId` (+ `providerId` quando autenticado)    |
+| `WagerQueueConsumer`, por mensagem                  | `correlationId`, `messageId`, `walletId`, `providerId` |
+| Worker de pendências, por candidato                 | `correlationId` original, `transactionId`, `walletId`  |
+
+- **Interceptor, não middleware:** o body parser retoma em eventos de stream, fora do contexto
+  assíncrono do middleware. O interceptor faz o `subscribe` do handler dentro do `run`.
+- **Camada de aplicação:** não conhece o ALS. O warn do `TransactionRunner` ("retrying") sai com o
+  `correlationId` sem recebê-lo, e um teste prova isso com lock timeout real.
+
+**Dados sensíveis:** há duas barreiras.
+
+- A porta `Logger` só aceita escalares, e quem chama loga identificadores.
+- O `redact` do pino troca por `[REDACTED]` as chaves `amount`, `balance`, `money`, `payload`,
+  `body`, `data`, `headers`, `authorization` e `cookie`, no topo ou um nível abaixo.
+
+O log de acesso HTTP (`http request`) tem método, path sem query, status, duração e `correlationId`.
+Nunca tem headers nem corpo. `/health` e `/metrics` não entram nesse log.
+
+### correlationId ponta a ponta
+
+```
+HTTP X-Correlation-Id / atributo SQS correlationId
+  → RequestContext → ProcessWagerTransaction
+     → wager_transactions.correlation_id (mesma transação SQL)
+     → payload dos eventos na outbox → atributo correlationId da mensagem publicada
+  → worker de PENDING_REFERENCE lê correlation_id → eventos da resolução com o mesmo id
+```
+
+- **Coluna:** `wager_transactions.correlation_id`, criada pela migration
+  `Migration20261026000100_transaction_correlation`. É `varchar(128)`, o mesmo limite do header.
+  Sem ela, os eventos emitidos minutos depois pelo worker perderiam a ligação com a requisição
+  original.
+- **Nullable:** linhas anteriores à migration não têm o valor, e não inventamos um. Nesse caso o
+  worker gera um id novo.
+- **Imutável:** entra na tupla de campos imutáveis do trigger `wws_wager_transactions_guard`. Um
+  replay não altera o valor gravado, que fica sendo o da primeira requisição.
+- **Fora do `payloadHash`:** é metadado de transporte. Duas requisições iguais com `correlationId`
+  diferentes são replay, não conflito.
+
+### Métricas (`/metrics`, prom-client)
+
+- **Exposição:** a API expõe `GET /metrics` (público, como o health), e cada worker expõe `/metrics`
+  na porta de health interna (`WORKER_HEALTH_PORT`).
+- **Labels padrão:** `process` e `instance` em toda série.
+- **Métricas de processo:** CPU, memória e event loop (`collectDefaultMetrics`).
+
+| Exigência (seção 12)          | Métrica                                                                  | Labels                                                                           |
+| ----------------------------- | ------------------------------------------------------------------------ | -------------------------------------------------------------------------------- |
+| Transações por status         | `wws_wager_transactions_total`                                           | `kind`, `status`, `source` (`http`/`sqs`/`pending_worker`)                       |
+| Duplicatas detectadas         | `wws_duplicates_total`                                                   | `type`: `replay`, `idempotency_conflict`, `inbox_redelivery`, `poison`           |
+| Retries                       | `wws_retries_total`                                                      | `component` (`transaction`, `consumer`, `outbox`, `pending_reference`), `reason` |
+| Mensagens em DLQ              | `wws_sqs_dlq_messages` (gauge) e `wws_sqs_dlq_sent_total`                | `queue` / `reason`                                                               |
+| Conflitos de lock             | `wws_lock_conflicts_total` e `wws_wallet_lock_wait_seconds` (histograma) | `reason`: `lock_timeout` (55P03), `deadlock` (40P01), `serialization` (40001)    |
+| Outbox lag                    | `wws_outbox_oldest_pending_age_seconds`, `wws_outbox_pending`            | —                                                                                |
+| Latência de processamento     | `wws_wager_processing_duration_seconds` (histograma)                     | `kind`, `source`, `outcome` (status, `REPLAY` ou código do erro)                 |
+| Divergências de reconciliação | `wws_reconciliation_divergences_total`                                   | —                                                                                |
+
+Decisões:
+
+- **Nada monetário:** nenhuma métrica carrega dinheiro, nem como valor nem como label. Também não há
+  label de alta cardinalidade (`walletId`, `providerId`, ids). Um teste unitário varre nomes e labels
+  do registry.
+- **Kind sem input cru:** o `kind` só vira label depois de validado; senão vira `INVALID`.
+- **`wager_transactions_total` conta entradas em status, sem replay.** Um REFUND que espera conta
+  `PENDING_REFERENCE` (`http`/`sqs`) e, depois, `PROCESSED` (`pending_worker`).
+- **Duplicata contada uma vez:** só depois da tentativa que valeu. Uma tentativa repetida por erro
+  transitório não conta duas vezes. Uma redelivery já registrada na inbox conta como
+  `inbox_redelivery`, não como `replay`.
+- **Conflito de lock contado sempre:** o `TransactionRunner` conta todo conflito, mesmo o da última
+  tentativa (que vira 503 ou volta à fila). Já `wws_retries_total` conta só o que será repetido.
+- **Profundidade da DLQ:** é lida no scrape, por `GetQueueAttributes(ApproximateNumberOfMessages)`
+  com timeout de 2 s, só no processo consumidor. É um valor da fila, então as réplicas reportam o
+  mesmo número; agregue com `max`, não `sum`. Se o SQS não responde, a série fica fora daquele scrape
+  em vez de repetir um valor velho.
+- **Latência:** é medida com `performance.now()` na camada de aplicação, só para observabilidade.
+  Nunca é gravada nem decide nada; o domínio continua sem relógio.
+- **Testes:** os adaptadores em memória viraram dublês de teste (`test/support/in-memory-telemetry.ts`).
+  Produção usa só Prometheus.
+
+### Testes
+
+- **Unitários** (`test/unit/infrastructure/observability/`):
+  - formato da linha;
+  - contexto com os cinco campos (aninhado, explícito vencendo, sem vazamento fora do `run`);
+  - redaction;
+  - cada métrica exigida no texto do registry;
+  - nenhum nome ou label monetário;
+  - DLQ fora do scrape quando o SQS cai.
+  - readiness: 503 com Postgres ou SQS fora, liveness 200 e `/metrics` no servidor de health dos
+    workers.
+- **Integração:**
+  - `observability-api.spec.ts`:
+    - log do use case com os cinco campos;
+    - nenhum valor monetário nem token `Authorization` em todo o log;
+    - retry do runner herdando o `correlationId`;
+    - `/metrics` aberto com transações, duplicatas, latência, lock wait, conflitos e retries.
+  - `consumer-observability.spec.ts`: `messageId` e `correlationId` do atributo no log; profundidade
+    real da DLQ no LocalStack.
+  - `pending-reference-worker.spec.ts`: eventos da resolução com o `correlationId` original.
+  - Schema: coluna nova imutável, migration up/down.
+  - Spike: `/metrics` de cada worker e stdout 100% JSON nos entrypoints reais.
+
+### Limitações e próximos passos
+
+- Sem OpenTelemetry/tracing distribuído. O `correlationId` cumpre o papel de amarrar logs e eventos.
+- Sem dashboard nem alertas versionados. Os alertas óbvios seriam outbox lag crescente, DLQ > 0,
+  taxa de `lock_conflicts` e p99 de latência.
+- O `/metrics` da API passa pelo nginx. Em produção ficaria só na rede interna.
+
+---
+
+## 15. Autenticação (ponto de extensão, sem IdP nesta entrega)
+
+### Decisão: não integrar um IdP agora
+
+A seção 2 do desafio dá peso 0 à autenticação e pede que ela não compita com correção financeira,
+concorrência e idempotência. O timebox foi para essas áreas. O que fica no código é o **ponto de
+extensão explícito**, já aplicado a todas as rotas:
+
+- **`ProviderIdentityPort`** (`src/application/ports/provider-identity.ts`):
+  `resolve(credentials) → ProviderPrincipal`. O principal pode ser:
+  - `{ kind: "provider", providerId }`: credencial provou o provedor;
+  - `{ kind: "unverified" }`: HTTP sem IdP, o caso desta entrega;
+  - `{ kind: "internal-channel" }`: a fila SQS.
+
+  O adaptador lança `UnauthenticatedError` (401) quando não há credencial válida.
+
+- **`AuthGuard`** global (`APP_GUARD`): toda rota resolve o principal e o leva ao `RequestContext`.
+  Só `@Public()` escapa, e hoje só `HealthController` e `MetricsController` usam (o health é aberto,
+  como pede a seção 2). Rota nova nasce protegida.
+- **`NoopProviderIdentityAdapter`:** responde `unverified`, então nada é restringido.
+- **Regra no use case, não no guard:** `assertActsAsProvider` roda em `ProcessWagerTransaction`,
+  depois de validar o `providerId` e antes de qualquer SQL, e em `GetTransactionByExternalId`. Se um
+  `provider` autenticado age por outro `providerId`, a resposta é `PROVIDER_IDENTITY_MISMATCH` (403),
+  sem nada persistido.
+- **Fila SQS:** é tratada como canal interno confiável (`internal-channel`). O `providerId` da
+  mensagem continua passando pelas mesmas validações de domínio: texto obrigatório, provedor
+  reservado `internal` recusado, referência do mesmo provedor e unicidade por provedor.
+
+O teste `auth-api.spec.ts` liga um adaptador falso ("Bearer <providerId>") e prova o comportamento:
+
+- health e metrics abertos, sem chamar o adaptador;
+- as demais rotas passam pelo guard (401 sem credencial);
+- 403 com nada gravado quando o provedor diverge;
+- leitura por `externalTransactionId` restrita ao próprio provedor.
+
+### Desenho com Keycloak (o que seria adotado)
+
+1. **Realm** `wallet` com um **client confidencial por provedor** (`provider-acme`, ...). O fluxo é
+   **client credentials** (máquina a máquina, sem usuário). O provedor guarda `client_id` e
+   `client_secret`, ou usa `private_key_jwt`, que é preferível porque o segredo não trafega.
+2. **Claim do provedor:** um protocol mapper (hardcoded claim por client) coloca
+   `provider_id: "acme"` no access token. A identidade vem do token, nunca do corpo da requisição.
+   Client scopes separam permissões, por exemplo `wagering:write` e `wallets:admin`.
+3. **Validação na API** pelo `OidcProviderIdentityAdapter`, o substituto do no-op:
+   - JWT RS256/ES256 validado contra o **JWKS** do realm (`/protocol/openid-connect/certs`);
+   - chaves em cache, recarregadas quando aparece um `kid` desconhecido (rotação sem restart);
+   - confere `iss`, `aud` (o client da API), `exp`/`nbf` com pequena tolerância de clock e o
+     scope da rota;
+   - devolve `{ kind: "provider", providerId: claims.provider_id }`.
+
+   Não há introspecção por requisição: a validação é local, sem round trip ao IdP.
+
+4. **Sem mudança no use case:** a regra `assertActsAsProvider` já existe. Trocar o adaptador no
+   `AuthModule` é a única alteração.
+5. **Fila:** fica como canal interno. Em produção a garantia vem da infraestrutura (policy da fila e
+   IAM só para os produtores autorizados), não de token na mensagem.
+6. **Compose:** Keycloak com import do realm (`--import-realm`) e clients de teste; os testes
+   pediriam tokens reais ao IdP.
+
+Por que não autenticação artesanal: o desafio pede IdP externo, e tabela de usuários com hash de
+senha está fora.

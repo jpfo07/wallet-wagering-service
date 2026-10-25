@@ -31,6 +31,7 @@ export const WagerTransactionMapper = {
       kind,
       money: moneyFromColumns(row.amount, row.currency),
       referenceExternalTransactionId: orUndefined(row.referenceExternalTransactionId),
+      correlationId: orUndefined(row.correlationId),
       createdAt: row.createdAt,
       status,
       referenceTransactionId: orUndefined(row.referenceTransactionId),
@@ -71,6 +72,7 @@ export const WagerTransactionMapper = {
       referenceAttempts: tx.referenceAttempts,
       nextReferenceCheckAt: tx.nextReferenceCheckAt ?? null,
       referenceExpiresAt: tx.referenceExpiresAt ?? null,
+      correlationId: tx.correlationId ?? null,
       createdAt: tx.createdAt,
       updatedAt: tx.updatedAt,
     };

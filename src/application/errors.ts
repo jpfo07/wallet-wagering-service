@@ -60,6 +60,26 @@ export class IdempotencyConflictError extends ApplicationError<
   }
 }
 
+/** The identity adapter found no valid provider credentials (HTTP 401). */
+export class UnauthenticatedError extends ApplicationError<ErrorCode.Unauthenticated> {
+  constructor(message = "valid provider credentials are required") {
+    super(ErrorCode.Unauthenticated, message);
+  }
+}
+
+/** The authenticated provider acts on behalf of another providerId (HTTP 403). Nothing is stored. */
+export class ProviderIdentityMismatchError extends ApplicationError<ErrorCode.ProviderIdentityMismatch> {
+  constructor(
+    readonly authenticatedProviderId: string,
+    readonly requestedProviderId: string,
+  ) {
+    super(
+      ErrorCode.ProviderIdentityMismatch,
+      "the authenticated provider cannot act on behalf of another providerId",
+    );
+  }
+}
+
 /** Same (consumerName, messageId) with a different payload: never processable (SQS → DLQ). */
 export class PoisonMessageError extends ApplicationError<"POISON_MESSAGE"> {
   constructor(
