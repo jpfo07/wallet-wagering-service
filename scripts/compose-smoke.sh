@@ -3,6 +3,7 @@
 #   1. sobe tudo com --wait (healthchecks) e confere que as migrations saíram com 0;
 #   2. confere réplicas e saúde de cada serviço;
 #   3. 30 requisições pelo nginx precisam alcançar 3 instâncias distintas da API;
+#   3b. /metrics: 404 pelo nginx, 200 dentro da API e de cada worker;
 #   4. failover: derruba uma réplica, o nginx continua respondendo pelas outras; depois ela volta.
 #      Da subida ao fim do failover, NENHUMA requisição pode falhar: as do script e as de um prober em
 #      segundo plano (GET e um POST de leitura) são todas exigidas 2xx. A única espera é a do pool do
@@ -122,6 +123,22 @@ echo "ok: 30 requisições atendidas por 3 instâncias ($(sort <<<"$ids" | uniq 
 ready=$(curl -fsS "$BASE_URL/health/ready")
 [[ "$ready" == *'"postgres":"up"'* && "$ready" == *'"sqs":"up"'* ]] || fail "readiness inesperado: $ready"
 echo "ok: /health/ready pelo nginx: $ready"
+
+echo "==> /metrics só na rede interna"
+for path in /metrics /metrics/ "/metrics?x=1"; do
+  status=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$BASE_URL$path") || true
+  [[ "$status" == "404" ]] || fail "GET $path pelo nginx deu ${status:-sem resposta}, esperado 404"
+done
+# Dentro do container o processo continua expondo as métricas (a API na 3000, os workers na 9100).
+internal_metrics() {
+  docker compose exec -T "$1" bun -e \
+    "const r = await fetch('http://127.0.0.1:$2/metrics'); const t = await r.text(); if (r.status !== 200 || !t.includes('wws_')) process.exit(1)"
+}
+internal_metrics api 3000 || fail "/metrics da API não respondeu dentro do container"
+for service in sqs-consumer outbox-publisher pending-reference-worker; do
+  internal_metrics "$service" 9100 || fail "/metrics de $service não respondeu dentro do container"
+done
+echo "ok: /metrics 404 pelo nginx; 200 com séries wws_ dentro da API e dos 3 workers"
 
 echo "==> failover: derrubando uma réplica da API (com tráfego GET e POST em segundo plano)"
 wallet=$(curl -fsS -X POST "$BASE_URL/wallets" -H 'content-type: application/json' \
