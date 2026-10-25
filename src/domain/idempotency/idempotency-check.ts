@@ -3,11 +3,15 @@ import { ErrorCode } from "../shared/failure-code.ts";
 import type { WagerTransaction } from "../wager/wager-transaction.ts";
 
 export interface IdempotencyCheckInput {
-  /** Existing transaction with the same idempotency key, if any. */
+  /** Existing transaction with the same (providerId, idempotencyKey), if any. */
   readonly byKey: WagerTransaction | undefined;
   /** Existing transaction with the same (providerId, externalTransactionId), if any. */
   readonly byExternalId: WagerTransaction | undefined;
-  readonly incoming: { readonly idempotencyKey: string; readonly payloadHash: string };
+  readonly incoming: {
+    readonly providerId: string;
+    readonly idempotencyKey: string;
+    readonly payloadHash: string;
+  };
 }
 
 export type IdempotencyDecision =
@@ -20,6 +24,9 @@ export type IdempotencyDecision =
     };
 
 /**
+ * Keys are scoped by provider: (providerId, idempotencyKey) is unique, so one provider can never
+ * occupy, replay or conflict with another provider's keys.
+ *
  * The idempotency key is the source of truth:
  * - same key, same payload hash → REPLAY (original response, including REJECTED/PENDING_REFERENCE);
  * - same key, different payload → conflict, never a replay;
@@ -28,9 +35,15 @@ export type IdempotencyDecision =
  */
 export function checkIdempotency(input: IdempotencyCheckInput): IdempotencyDecision {
   const { byKey, byExternalId, incoming } = input;
+  if (byExternalId !== undefined && byExternalId.providerId !== incoming.providerId) {
+    throw new InvalidOperationError("byExternalId must belong to the incoming provider");
+  }
   if (byKey !== undefined) {
-    if (byKey.idempotencyKey !== incoming.idempotencyKey) {
-      throw new InvalidOperationError("byKey must have the incoming idempotency key");
+    if (
+      byKey.providerId !== incoming.providerId ||
+      byKey.idempotencyKey !== incoming.idempotencyKey
+    ) {
+      throw new InvalidOperationError("byKey must have the incoming provider and idempotency key");
     }
     return byKey.matchesPayload(incoming.payloadHash)
       ? { type: "REPLAY", transaction: byKey }

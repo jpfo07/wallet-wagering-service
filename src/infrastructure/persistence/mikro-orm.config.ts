@@ -3,6 +3,7 @@ import { Migrator } from "@mikro-orm/migrations";
 import { defineConfig } from "@mikro-orm/postgresql";
 import type { Options } from "@mikro-orm/postgresql";
 import type { DatabaseConfig } from "../config/env.ts";
+import { PERSISTENCE_MODELS } from "./models/index.ts";
 
 export const MIGRATIONS_PATH = fileURLToPath(new URL("./migrations", import.meta.url));
 
@@ -25,8 +26,7 @@ export function buildOrmOptions(db: DatabaseConfig, overrides: Partial<Options> 
     driverOptions: {
       options: `-c lock_timeout=${db.lockTimeoutMs} -c statement_timeout=${db.statementTimeoutMs}`,
     },
-    entities: [],
-    discovery: { warnWhenNoEntities: false },
+    entities: [...PERSISTENCE_MODELS],
     extensions: [Migrator],
     migrations: {
       path: MIGRATIONS_PATH,

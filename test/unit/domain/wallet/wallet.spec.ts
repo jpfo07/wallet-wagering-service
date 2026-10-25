@@ -36,6 +36,7 @@ describe("Wallet.open", () => {
     expect(entry?.transactionId).toBe("opening-wallet-1");
     expect(entry?.balanceBefore.amount).toBe("0.00");
     expect(entry?.balanceAfter.amount).toBe("100.00");
+    expect(entry?.walletVersion).toBe(1);
   });
 
   test("the currency comes from the initial balance", () => {
@@ -84,6 +85,7 @@ describe("Wallet debit/credit", () => {
     expect(entry.direction).toBe(LedgerDirection.Debit);
     expect(entry.balanceBefore.amount).toBe("100.00");
     expect(entry.balanceAfter.amount).toBe("75.00");
+    expect(entry.walletVersion).toBe(2);
     expect(wallet.pullNewLedgerEntries()).toEqual([entry]);
   });
 
@@ -93,6 +95,13 @@ describe("Wallet debit/credit", () => {
     expect(wallet.balance.amount).toBe("150.00");
     expect(wallet.version).toBe(2);
     expect(entry.direction).toBe(LedgerDirection.Credit);
+  });
+
+  test("first movement of a wallet opened with zero carries walletVersion 2 (no entry at 1)", () => {
+    const wallet = newWallet({ balance: "0.00" });
+    const entry = wallet.credit(movement("win-1", "50.00"));
+    expect(entry.walletVersion).toBe(2);
+    expect(entry.walletVersion).toBe(wallet.version);
   });
 
   test("debiting the exact balance reaches zero", () => {
@@ -173,6 +182,7 @@ describe("Wallet balance == balance rebuilt from its ledger", () => {
     expect(rebuilt.equals(wallet.balance)).toBe(true);
     expect(wallet.balance.amount).toBe("0.01");
     expect(wallet.version).toBe(5);
+    expect(entries.map((entry) => entry.walletVersion)).toEqual([1, 2, 3, 4, 5]);
     for (let index = 1; index < entries.length; index += 1) {
       expect(
         entries[index]?.balanceBefore.equals(entries[index - 1]?.balanceAfter ?? brl("0.00")),

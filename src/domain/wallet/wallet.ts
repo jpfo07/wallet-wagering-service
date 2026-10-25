@@ -150,6 +150,7 @@ export class Wallet {
       direction === LedgerDirection.Credit
         ? balanceBefore.add(money)
         : balanceBefore.subtract(money);
+    const versionAfter = options.bumpVersion ? this._version + 1 : this._version;
     const entry = WalletLedgerEntry.create({
       id: ledgerEntryId,
       walletId: this.id,
@@ -158,13 +159,12 @@ export class Wallet {
       money,
       balanceBefore,
       balanceAfter,
+      walletVersion: versionAfter,
       createdAt: at,
     });
 
     this._balance = balanceAfter;
-    if (options.bumpVersion) {
-      this._version += 1;
-    }
+    this._version = versionAfter;
     this._updatedAt = at;
     this.newLedgerEntries.push(entry);
     this.movedTransactionIds.add(transactionId);

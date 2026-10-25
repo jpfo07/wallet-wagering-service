@@ -16,3 +16,9 @@ export const TERMINAL_STATUSES: ReadonlySet<WagerTransactionStatus> = new Set([
   WagerTransactionStatus.Rejected,
   WagerTransactionStatus.Failed,
 ]);
+
+const STATUSES: ReadonlySet<string> = new Set(Object.values(WagerTransactionStatus));
+
+export function isWagerTransactionStatus(value: string): value is WagerTransactionStatus {
+  return STATUSES.has(value);
+}

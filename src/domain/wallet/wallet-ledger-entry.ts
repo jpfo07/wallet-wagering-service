@@ -10,6 +10,8 @@ export interface LedgerEntryState {
   readonly money: Money;
   readonly balanceBefore: Money;
   readonly balanceAfter: Money;
+  /** Wallet version right after this entry (1 for the OPENING credit); orders the wallet's ledger. */
+  readonly walletVersion: number;
   readonly createdAt: Date;
 }
 
@@ -24,6 +26,7 @@ export class WalletLedgerEntry {
   readonly money: Money;
   readonly balanceBefore: Money;
   readonly balanceAfter: Money;
+  readonly walletVersion: number;
   readonly createdAt: Date;
 
   private constructor(state: LedgerEntryState) {
@@ -34,6 +37,7 @@ export class WalletLedgerEntry {
     this.money = state.money;
     this.balanceBefore = state.balanceBefore;
     this.balanceAfter = state.balanceAfter;
+    this.walletVersion = state.walletVersion;
     this.createdAt = new Date(state.createdAt.getTime());
     Object.freeze(this);
   }
@@ -48,6 +52,9 @@ export class WalletLedgerEntry {
     }
     if (balanceBefore.isNegative() || balanceAfter.isNegative()) {
       throw new InvalidLedgerEntryError("ledger entry balances must not be negative");
+    }
+    if (!Number.isSafeInteger(props.walletVersion) || props.walletVersion < 1) {
+      throw new InvalidLedgerEntryError("ledger entry walletVersion must be an integer >= 1");
     }
     const entry = new WalletLedgerEntry(props);
     if (!entry.isBalanced()) {

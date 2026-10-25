@@ -328,6 +328,9 @@ Entrada malformada lança `ValidationError` (vira 400). Todo erro tem um `code` 
 4. Uma movimentação por transação por wallet (o `UNIQUE(transaction_id, wallet_id)` é o backstop).
 5. `version = 1` após a criação, inclusive com o crédito de abertura (ele faz parte da criação), e
    incrementa a cada mudança de saldo depois disso.
+6. Cada lançamento guarda `walletVersion`, a versão da wallet **depois** dele (a OPENING fica com 1;
+   o primeiro movimento de uma wallet aberta com zero fica com 2). Isso ordena o ledger de cada wallet
+   sem depender de relógio e permite ao banco conferir a corrente (seção 9).
 
 `WalletLedgerEntry` é imutável por estrutura: campos `readonly`, instância congelada e nenhum método
 além de `isBalanced()`.
@@ -487,10 +490,16 @@ PENDING_REFERENCE não é falha: o provedor pode consultar a transação ou reen
 - `payloadHash = SHA-256(JSON canônico)` em hex minúsculo. Um teste "golden" fixa o valor de um
   payload conhecido, calculado fora do código: mudar o algoritmo sem querer transformaria todo replay
   em conflito.
-- `checkIdempotency`: mesma chave e mesmo hash → REPLAY; mesma chave e hash diferente →
-  `IDEMPOTENCY_KEY_REUSED`; chave nova para um `(providerId, externalTransactionId)` existente →
-  `EXTERNAL_TRANSACTION_ID_CONFLICT`, mesmo com payload idêntico (uma operação do provedor não pode
-  viver sob duas chaves).
+- **Chave escopada por provedor:** a unicidade é `(providerId, idempotencyKey)`, não a chave
+  sozinha. Um provedor não consegue "ocupar" a chave de outro (nem receber o replay ou o conflito de
+  outro): a mesma string de chave enviada por dois provedores são duas chaves diferentes. A busca de
+  idempotência é feita por `(providerId, idempotencyKey)`. O default `"{providerId}:{externalTransactionId}"`
+  continua válido (e já é naturalmente único por provedor).
+- `checkIdempotency`: mesma chave (do mesmo provedor) e mesmo hash → REPLAY; mesma chave e hash
+  diferente → `IDEMPOTENCY_KEY_REUSED`; chave nova para um `(providerId, externalTransactionId)`
+  existente → `EXTERNAL_TRANSACTION_ID_CONFLICT`, mesmo com payload idêntico (uma operação do
+  provedor não pode viver sob duas chaves). Receber linhas de outro provedor é bug de quem carregou
+  e lança `InvalidOperationError`.
 
 ### Eventos, inbox e outbox
 
@@ -518,4 +527,193 @@ PENDING_REFERENCE não é falha: o provedor pode consultar a transação ou reen
   serializados por ele, e os dois desfechos são coerentes: WIN primeiro → REFUND recusado
   (`REFERENCE_HAS_ACTIVE_SETTLEMENT`); REFUND primeiro → WIN recusado (`REFERENCE_ALREADY_REVERSED`).
 - **Detecção de movimento duplicado na wallet** vale para a instância em memória. Entre processos, o
-  backstop é o `UNIQUE(transaction_id, wallet_id)` do ledger.
+  backstop é o schema: `UNIQUE(transaction_id, wallet_id)` e a corrente do ledger (seção 9).
+
+## 9. Schema, constraints e migrations
+
+**Princípio:** o domínio decide o **resultado de negócio** (PROCESSED, ou REJECTED com `failureCode`).
+O banco é a **última barreira**: ele não decide nada, só recusa qualquer estado que corromperia
+dinheiro, mesmo com bug no código, com várias instâncias ou com alguém rodando SQL na mão. No
+caminho normal nenhuma constraint dispara; se uma disparar, é bug.
+
+Uma constraint só sabe **recusar** (lança exceção e desfaz a transação SQL inteira). Ela não produz
+"REJECTED com `INSUFFICIENT_FUNDS`", que é uma resposta persistida e devolvida no replay. Por isso
+as regras de negócio ficam no domínio e o banco guarda o que não pode ser violado nunca.
+
+### Tabelas
+
+| Tabela                  | Papel                                                                                         |
+| ----------------------- | --------------------------------------------------------------------------------------------- |
+| `wallets`               | saldo materializado (`numeric(20,2)` + `char(3)`), `version`                                  |
+| `wager_transactions`    | registro de idempotência + resultado (inclui saldo observado e controle do PENDING_REFERENCE) |
+| `wallet_ledger_entries` | ledger append-only; `wallet_version` ordena os lançamentos de cada wallet                     |
+| `inbox_messages`        | dedup persistente das entregas SQS, PK `(consumer_name, message_id)`                          |
+| `outbox_messages`       | eventos confirmados aguardando publicação                                                     |
+
+Convenções:
+
+- **Dinheiro** sempre `numeric(20,2)` + `currency char(3)`; nenhuma coluna `real`/`double`/`money`
+  (um teste de integração confere no `information_schema`).
+- **Sem `DEFAULT now()`**: hora e ID vêm do `Clock`/`IdGenerator`. Um default esconderia um bug de
+  mapper (coluna esquecida que ganha valor em silêncio).
+- **`timestamptz(3)`**: a precisão do `Date` do JS. A ida e volta é exata.
+- **`text` + `CHECK ... IN (...)`** em vez de `ENUM`: acrescentar um valor é trocar o CHECK numa
+  migration nova (um `ENUM` não remove valor, e o `ALTER TYPE` tem restrições dentro de transação).
+- **Nenhuma checagem de ordem temporal entre colunas** (`updated_at >= created_at` etc.): com 3
+  instâncias os relógios divergem alguns ms, e uma linha criada pela instância A e atualizada pela
+  B pode "voltar no tempo". A constraint falharia por clock skew, não por bug. Pelo mesmo motivo o
+  ledger é ordenado por `wallet_version`, não por `created_at`.
+- **Erros dos triggers** usam SQLSTATE `23514` (classe 23, integridade, portanto **não transitório**)
+  e `USING CONSTRAINT = '<nome>'`. Os testes conferem o SQLSTATE **e** o nome, então um teste nunca
+  passa por causa de um erro qualquer.
+- **`PENDING` não é persistido:** a transação é decidida dentro da mesma transação SQL em que nasce.
+  O CHECK de status não aceita `PENDING`.
+- **Limite de 255 caracteres** (e não vazio) nos campos de texto vindos do provedor; o DTO da Fase 4
+  aplica o mesmo limite (400 antes de chegar no banco).
+- **`player_id uuid`**, como no contrato.
+
+### Constraint → invariante protegida
+
+| Constraint / trigger                                                                                                             | Protege                                                                                                 |
+| -------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `wallets_player_currency_uq`                                                                                                     | no máximo uma wallet por player + moeda, entre instâncias                                               |
+| `wallets_balance_non_negative_chk`, `wallet_ledger_entries_balances_non_negative_chk`, `wager_transactions_observed_balance_chk` | saldo nunca negativo                                                                                    |
+| `wallets_version_min_chk` + `wallets_guard` (`wallets_initial_version`, `wallets_version_rule`)                                  | `version` nasce 1 e sobe exatamente 1 a cada mudança de saldo                                           |
+| `wallets_guard` (`wallets_identity_immutable`), `wallets_no_delete`                                                              | id, player, moeda e criação da wallet nunca mudam; wallet não é apagada                                 |
+| `wager_transactions_provider_idempotency_key_uq`                                                                                 | idempotência persistente pela chave, **isolada por provedor**                                           |
+| `wager_transactions_provider_external_uq`                                                                                        | uma operação do provedor registrada uma única vez; também é o índice de busca da referência             |
+| `wager_transactions_single_reversal_uq` (índice único parcial)                                                                   | no máximo **uma** reversão PROCESSED (REFUND ou ROLLBACK) por referência, mesmo com corrida             |
+| `kind_chk`, `status_chk`, `failure_code_chk`                                                                                     | só valores do domínio; `failureCode` estável                                                            |
+| `processed/rejected/failed/pending_reference_state_chk`, `next_check_chk`                                                        | cada status tem exatamente as colunas que o domínio grava (máquina de estados)                          |
+| `reference_by_kind_chk`, `no_self_reference_chk`                                                                                 | REFUND/ROLLBACK exigem referência; BET/OPENING não têm; sem autorreferência                             |
+| `opening_internal_chk`, `opening_processed_chk`                                                                                  | OPENING só interno (`provider_id = 'internal'`) e sempre PROCESSED                                      |
+| `wager_transactions_amount_chk`, `wallet_ledger_entries_amount_positive_chk`                                                     | valores > 0 (LOSS aceita 0)                                                                             |
+| `wager_transactions_guard` (`terminal_immutable`, `business_fields_immutable`), `no_delete`                                      | PROCESSED/REJECTED/FAILED nunca mudam; o registro de idempotência (inclusive `payload_hash`) é imutável |
+| `wager_transactions_observed_currency_fk`                                                                                        | o saldo observado está na moeda da wallet (no `CURRENCY_MISMATCH` a transação é em outra)               |
+| `wallet_ledger_entries_append_only` (UPDATE, DELETE, TRUNCATE)                                                                   | ledger nunca é sobrescrito nem apagado                                                                  |
+| `wallet_ledger_entries_arithmetic_chk`                                                                                           | `balance_before ± amount = balance_after` (e direção só DEBIT/CREDIT)                                   |
+| `wallet_ledger_entries_transaction_uq`                                                                                           | um lançamento por transação por wallet: impede débito/crédito duplicado                                 |
+| `wallet_ledger_entries_wallet_fk` `(wallet_id, currency)`                                                                        | lançamento na moeda da wallet                                                                           |
+| `wallet_ledger_entries_transaction_fk` `(transaction_id, wallet_id, currency, amount)`                                           | lançamento com a mesma wallet, moeda e valor da transação que o gerou                                   |
+| T4 `wallet_ledger_entries_chain` + `wallet_version_uq`                                                                           | o ledger é uma corrente contínua por wallet; serializa escritores da mesma wallet                       |
+| T5 `wallet_ledger_entries_matches_transaction` (deferido)                                                                        | só transação PROCESSED e não-LOSS gera lançamento, na direção do kind                                   |
+| T6 `wallets_matches_ledger` (deferido)                                                                                           | **`wallet.balance == saldo reconstruído pelo ledger`** em todo commit                                   |
+| T7 `wager_transactions_processed_has_entry` (deferido)                                                                           | toda transação aplicada que move saldo tem seu lançamento                                               |
+| `outbox_messages_schedule_chk` + `outbox_messages_pending_idx`                                                                   | nenhum evento pendente fica fora da busca do publisher (pendente sempre tem `next_attempt_at`)          |
+| `inbox_messages_pk`                                                                                                              | dedup persistente por `(consumerName, messageId)`                                                       |
+
+Índices de leitura: `wager_transactions_reference_idx` (dependentes de uma referência e seus
+ROLLBACKs, para o `ReferenceState`), `wager_transactions_pending_due_idx` (fila do worker de
+PENDING_REFERENCE) e `UNIQUE (wallet_id, wallet_version)`, que é o cursor do `GET /ledger`.
+
+### Saldo × ledger garantido pelo banco (T4–T7)
+
+O invariante final de todos os testes (`wallet.balance == saldo reconstruído pelo ledger`) também é
+uma constraint:
+
+1. **T4 (BEFORE INSERT no ledger):** trava a linha da wallet (`FOR NO KEY UPDATE`, reentrante com o
+   `FOR UPDATE` da aplicação), lê o último lançamento e exige `balance_before = último.balance_after`
+   (ou `0.00` no primeiro) e `wallet_version` crescente. Como a trava vem antes da leitura, dois
+   escritores da mesma wallet são serializados **pelo banco**, mesmo que a aplicação esqueça o lock:
+   o segundo espera, vê o lançamento do primeiro e é recusado. Isso é provado por um teste com duas
+   conexões em paralelo e sem lock da aplicação (`ledger-concurrency.spec.ts`).
+2. **T5, T6, T7 (deferidos):** no `COMMIT`, conferem que lançamento, transação e wallet contam a
+   mesma história: lançamento só de transação PROCESSED não-LOSS e na direção certa (BET debita;
+   WIN, REFUND e OPENING creditam; ROLLBACK faz o inverso do lançamento da referência); toda
+   transação aplicada tem lançamento; e o saldo/versão da wallet são os do último lançamento (ou
+   `0.00`/1 sem lançamento).
+
+A direção por kind repete em SQL a regra de `WagerTransaction.ledgerDirectionFor`. É a única regra
+de negócio duplicada no banco, e foi aceita porque é o que impede um crédito no lugar de um débito.
+A coerência completa da referência (mesmo provider, player, rodada; valor igual na reversão) **não**
+foi para o banco: duplicaria a maior parte do `settleWager`. Ela fica no domínio, sob o lock da
+wallet, com o índice de reversão única como backstop financeiro.
+
+### Por que FKs e checagens entre linhas são deferidas
+
+Os modelos de persistência não declaram relações (seção "Mapeamento"), então o MikroORM não ordena
+os INSERTs por dependência de FK. Isso apareceu num teste: num único flush, o lançamento foi gravado
+antes da wallet e a FK imediata recusou. Em vez de fazer a correção depender da ordem do ORM, as
+**FKs e T5–T7 são `DEFERRABLE INITIALLY DEFERRED`**: rodam no `COMMIT`, quando tudo já foi gravado.
+Continuam garantidas; só o momento muda. Se falharem, o commit inteiro é desfeito. **Unicidade
+continua imediata**: a duplicata é detectada no próprio comando.
+
+Consequência para a Fase 3: um erro de classe 23 pode chegar no `COMMIT` (pelo `em.transactional()`).
+Ele é tratado como bug (erro permanente), nunca como retry.
+
+### Camadas: trigger antes do CHECK
+
+Triggers `BEFORE` rodam antes dos CHECKs. Por isso `version = 0` num INSERT é recusado pelo
+`wallets_initial_version`, e uma `wallet_version` repetida pela corrente (T4), antes do
+`wallet_version_uq`. Os CHECKs e índices continuam lá como segunda camada, e os testes provam isso
+desligando o trigger dentro de uma transação que é desfeita. Os CHECKs são avaliados em ordem
+alfabética de nome, e os testes montam cada linha para violar **uma** constraint só. Um
+`direction_chk` separado no ledger seria inalcançável (a aritmética só aceita DEBIT ou CREDIT) e
+foi removido.
+
+### Onde cada garantia mora
+
+| Só no banco                                                                                       | Só no domínio                                                                                                                                                 | Nos dois                                                                  |
+| ------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| unicidade entre instâncias (wallet, chave por provedor, `(provider, externalId)`, reversão única) | regras que viram resultado: player da wallet, referência com mesmo provider/player/rodada, kind permitido, `effectivelyReversed`, `hasActiveWin`, valor igual | saldo ≥ 0 (domínio rejeita com `INSUFFICIENT_FUNDS`; o banco barra o bug) |
+| ledger append-only; transação e wallet sem DELETE                                                 | contrato estrito do Money (`"25"` é recusado; o `numeric` aceitaria)                                                                                          | aritmética do lançamento (`WalletLedgerEntry.create` + CHECK)             |
+| existência das referências (FKs)                                                                  | cálculo do `payloadHash` e decisão replay/conflito                                                                                                            | kinds, status e códigos válidos; referência obrigatória; OPENING interno  |
+| corrente do ledger e saldo × ledger (T4–T7)                                                       | mensagem envenenada na inbox; política de retry da outbox; expiração/backoff do PENDING_REFERENCE                                                             | terminais imutáveis (`assertTransition` + trigger); regra do `version`    |
+| serialização por wallet como backstop (T4)                                                        |                                                                                                                                                               | um lançamento por transação (`DuplicateLedgerMovementError` + UNIQUE)     |
+
+### Mapeamento MikroORM e Money
+
+- `src/infrastructure/persistence/models/`: um `defineEntity` por tabela, **só colunas escalares**
+  (sem `ManyToOne`). As FKs existem no SQL; o ORM não carrega relações e o domínio nunca vê um
+  modelo do ORM.
+- Dinheiro: `p.decimal("string").precision(20).scale(2)` + `p.character().length(3)`. O driver
+  devolve `numeric(20,2)` como string com 2 casas (`"0.10"`, `"975.00"`), que é exatamente o
+  contrato estrito do `Money.from`. `money-columns.ts` faz a conversão nos dois sentidos, e um valor
+  corrompido falha alto na leitura. Em nenhum ponto o valor passa por `number`. Um teste de
+  arquitetura proíbe `p.double`/`p.float`/`p.decimal("number")` nos modelos, `parseFloat`/`Number()`
+  nos mappers e exige `p.decimal("string")` em toda propriedade de dinheiro.
+- `src/infrastructure/persistence/mappers/`: `toDomain(row)` monta o `*State` e chama
+  `X.rehydrate()` (que não revalida transições), convertendo `null` → `undefined`
+  (`exactOptionalPropertyTypes`); `toRow(domain)` faz o inverso. `kind`, `status`, `direction` e
+  `failureCode` lidos do banco passam pelos type guards do domínio; valor desconhecido lança
+  `PersistenceMappingError` (o CHECK já impede, mas o mapper não confia cegamente).
+- Desenho para a Fase 3: a wallet será atualizada com `WHERE id = ? AND version = <versão lida>`,
+  conferindo as linhas afetadas. O `version` **não** é marcado como `version: true` no ORM, para que
+  o domínio seja a única fonte do incremento.
+
+### Migrations
+
+- **SQL escrito à mão** (`this.addSql`), nunca gerado por diff do ORM: o MikroORM não expressa CHECK,
+  trigger, índice parcial nem constraint trigger deferida, e um diff tentaria remover o que não
+  conhece. `migration:create` gera arquivo em branco.
+- Duas migrations transacionais: `financial_schema` (wallets, transações, ledger, funções e
+  triggers, que são interdependentes) e `messaging_schema` (inbox e outbox).
+- `down` na ordem inversa e **sem `CASCADE`**: se uma dependência foi esquecida, o down falha alto em
+  vez de apagar coisa a mais. Dropar a tabela remove os triggers e índices dela; as funções `wws_*`
+  são removidas em seguida.
+- Funções com prefixo `wws_`, `plpgsql` e `SET search_path = public` (não dependem do search_path
+  de quem chama).
+- Testes: `up → down (até zero) → up` sem sobras (`pg_class`/`pg_proc`), drift entre modelos e
+  colunas (nome e nulabilidade), tipos de dinheiro e precisão de datas, e `bun run
+image:migrations-check` na imagem `--production`.
+
+### Testes do schema (`test/integration/schema/`)
+
+Cada constraint é violada **direto no SQL** (sem domínio nem ORM) e o teste confere SQLSTATE e nome.
+`test/support/sql-fixtures.ts` monta cenários coerentes (wallet + OPENING + lançamento na mesma
+transação; movimentos com transação, lançamento e wallet juntos), e cada teste muda uma coisa só.
+Também há testes **positivos** dos caminhos que o domínio produz (PENDING_REFERENCE reagendado e
+depois resolvido com lançamento; REJECTED de `CURRENCY_MISMATCH`; FAILED sem saldo observado; LOSS 0;
+retry e `markPublished` na outbox), para que nenhuma constraint recuse um estado legítimo. Todos os
+cenários com movimento terminam com `assertLedgerInvariant`.
+
+### Limitações e próximos passos
+
+- **Superusuário fura trigger** (`DISABLE TRIGGER`, `session_replication_role = replica`). Hoje a
+  aplicação conecta como dona do schema. Melhoria: um papel de migration separado do papel da
+  aplicação, com `REVOKE UPDATE, DELETE, TRUNCATE` no ledger e nas transações.
+- **Custo no hot wallet:** T4 e T6 fazem uma ou duas buscas por índice por transação, desprezível
+  perto da espera pelo lock (a medir no teste de carga).
+- **Ordem dos eventos entre publishers (Fase 6):** com `SKIP LOCKED`, dois publishers podem publicar
+  eventos da mesma wallet fora de ordem no `wallet-events.fifo`. Fica para o desenho do publisher.
+- **Retenção:** inbox e outbox publicadas crescem sem limpeza.

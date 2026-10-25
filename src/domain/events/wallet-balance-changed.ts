@@ -34,7 +34,7 @@ export class WalletBalanceChanged extends IntegrationEvent<WalletBalanceChangedD
         money: entry.money.toJSON(),
         balanceBefore: entry.balanceBefore.toJSON(),
         balanceAfter: entry.balanceAfter.toJSON(),
-        walletVersion: wallet.version,
+        walletVersion: entry.walletVersion,
       }),
     );
   }

@@ -14,6 +14,7 @@ function props(overrides: Partial<CreateLedgerEntryProps> = {}): CreateLedgerEnt
     money: brl("25.00"),
     balanceBefore: brl("100.00"),
     balanceAfter: brl("75.00"),
+    walletVersion: 2,
     createdAt: T0,
     ...overrides,
   };
@@ -38,6 +39,8 @@ describe("WalletLedgerEntry.create", () => {
     ],
     ["mixed currencies", props({ money: usd("25.00") })],
     ["mixed balance currencies", props({ balanceAfter: usd("75.00") })],
+    ["walletVersion 0", props({ walletVersion: 0 })],
+    ["fractional walletVersion", props({ walletVersion: 1.5 })],
   ])("rejects %s", (_label, invalid) => {
     expect(() => WalletLedgerEntry.create(invalid)).toThrow(InvalidLedgerEntryError);
   });

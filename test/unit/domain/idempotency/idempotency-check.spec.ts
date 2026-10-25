@@ -3,7 +3,7 @@ import { checkIdempotency } from "../../../../src/domain/idempotency/idempotency
 import { InvalidOperationError } from "../../../../src/domain/shared/domain-error.ts";
 import { ErrorCode } from "../../../../src/domain/shared/failure-code.ts";
 import { WagerTransactionKind } from "../../../../src/domain/wager/wager-transaction-kind.ts";
-import { brl, wager } from "../../../support/domain-builders.ts";
+import { PROVIDER, brl, wager } from "../../../support/domain-builders.ts";
 
 const stored = wager(WagerTransactionKind.Bet, {
   externalTransactionId: "tx-1",
@@ -24,7 +24,11 @@ describe("checkIdempotency", () => {
       checkIdempotency({
         byKey: undefined,
         byExternalId: undefined,
-        incoming: { idempotencyKey: "provider-a:tx-1", payloadHash: samePayload.payloadHash },
+        incoming: {
+          providerId: PROVIDER,
+          idempotencyKey: "provider-a:tx-1",
+          payloadHash: samePayload.payloadHash,
+        },
       }),
     ).toEqual({ type: "NEW" });
   });
@@ -33,7 +37,11 @@ describe("checkIdempotency", () => {
     const decision = checkIdempotency({
       byKey: stored,
       byExternalId: stored,
-      incoming: { idempotencyKey: stored.idempotencyKey, payloadHash: samePayload.payloadHash },
+      incoming: {
+        providerId: PROVIDER,
+        idempotencyKey: stored.idempotencyKey,
+        payloadHash: samePayload.payloadHash,
+      },
     });
     expect(decision).toEqual({ type: "REPLAY", transaction: stored });
   });
@@ -44,6 +52,7 @@ describe("checkIdempotency", () => {
       byKey: stored,
       byExternalId: stored,
       incoming: {
+        providerId: PROVIDER,
         idempotencyKey: stored.idempotencyKey,
         payloadHash: divergentPayload.payloadHash,
       },
@@ -59,7 +68,11 @@ describe("checkIdempotency", () => {
     const decision = checkIdempotency({
       byKey: undefined,
       byExternalId: stored,
-      incoming: { idempotencyKey: "another-key", payloadHash: samePayload.payloadHash },
+      incoming: {
+        providerId: PROVIDER,
+        idempotencyKey: "another-key",
+        payloadHash: samePayload.payloadHash,
+      },
     });
     expect(decision).toEqual({
       type: "CONFLICT",
@@ -68,12 +81,43 @@ describe("checkIdempotency", () => {
     });
   });
 
-  test("byKey must actually carry the incoming key", () => {
+  test("the same key under another provider is a different key → NEW, never a replay or conflict", () => {
+    // The lookup is by (providerId, idempotencyKey): provider-b finds nothing under provider-a's key.
+    const decision = checkIdempotency({
+      byKey: undefined,
+      byExternalId: undefined,
+      incoming: {
+        providerId: "provider-b",
+        idempotencyKey: stored.idempotencyKey,
+        payloadHash: stored.payloadHash,
+      },
+    });
+    expect(decision).toEqual({ type: "NEW" });
+  });
+
+  test.each([
+    ["another key", { providerId: PROVIDER, idempotencyKey: "other" }],
+    ["another provider", { providerId: "provider-b", idempotencyKey: "provider-a:tx-1" }],
+  ])("byKey must carry the incoming provider and key (%s)", (_label, incoming) => {
     expect(() =>
       checkIdempotency({
         byKey: stored,
         byExternalId: undefined,
-        incoming: { idempotencyKey: "other", payloadHash: stored.payloadHash },
+        incoming: { ...incoming, payloadHash: stored.payloadHash },
+      }),
+    ).toThrow(InvalidOperationError);
+  });
+
+  test("byExternalId must belong to the incoming provider", () => {
+    expect(() =>
+      checkIdempotency({
+        byKey: undefined,
+        byExternalId: stored,
+        incoming: {
+          providerId: "provider-b",
+          idempotencyKey: "k",
+          payloadHash: stored.payloadHash,
+        },
       }),
     ).toThrow(InvalidOperationError);
   });
