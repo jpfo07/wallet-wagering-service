@@ -219,19 +219,31 @@ localstack (healthy = init concluído) ───────┼──► api ×3
 - **Uma única porta da API (8080, no nginx).** Postgres e LocalStack ficam expostos só em `127.0.0.1`,
   para ferramentas locais.
 - **nginx na frente das 3 APIs:**
-  - `resolver 127.0.0.11 valid=5s` + `server api:3000 resolve` (nginx ≥ 1.27.3): o nome `api` resolve
-    para os IPs de todas as réplicas e é reavaliado continuamente; uma réplica que reinicia com outro
-    IP volta ao pool sozinha.
-  - `proxy_next_upstream error timeout http_502 http_503`: se uma réplica não responde, a requisição é
-    refeita em outra, **só para métodos idempotentes**. O nginx nunca reenvia POST. Quem reenvia uma
-    transação é o provedor, e a idempotência persistente protege esse caso.
+  - `resolver 127.0.0.11 valid=1s` + `server api:3000 resolve max_fails=1 fail_timeout=3s` (nginx
+    ≥ 1.27.3): o nome `api` resolve para os IPs de todas as réplicas e é reavaliado a cada 1 s. Uma
+    réplica recriada (outro IP) entra no pool, e uma parada sai dele, sem reiniciar o nginx. O nginx
+    open source não tem health check ativo: uma falha de conexão tira o IP do pool por 3 s.
+  - `proxy_next_upstream error timeout http_502 http_503`, com `proxy_next_upstream_tries 0` e
+    `proxy_next_upstream_timeout 5s`:
+    - **recusa de conexão:** nada foi enviado, então a requisição vai para outra réplica, qualquer que
+      seja o método;
+    - **requisição já enviada:** só métodos idempotentes são reenviados. O nginx nunca reenvia um POST
+      enviado; quem reenvia uma transação é o provedor, e a idempotência persistente protege esse caso;
+    - **por que todas as réplicas, num prazo:** durante uma troca de réplicas o DNS pode listar mais
+      IPs mortos do que um limite fixo de tentativas cobre (seção 16).
+  - **`keepalive_timeout 2s` no upstream e drain na API:** no SIGTERM, cada réplica da API passa
+    `HTTP_SHUTDOWN_DRAIN_MS` (2,5 s) atendendo com `Connection: close` e readiness 503, e só então
+    fecha a porta. Quando ela fecha, o nginx já descartou todo socket ocioso para ela, então um POST
+    nunca cai num socket que a réplica fechou (seção 16).
   - Cada resposta traz `X-Instance-Id` (definido pela API) e `X-Upstream-Addr` (definido pelo nginx),
     o que deixa visível qual réplica atendeu.
-- **Workers** (o `sqs-consumer` tem loop desde a Fase 5; os outros dois são placeholders até a
-  Fase 6): sobem o contexto Nest (DI, ORM, cliente SQS) e um
-  servidor HTTP interno (`WORKER_HEALTH_PORT`, 9100) com `/health/live` e `/health/ready`. No SIGTERM
-  saem com 0 depois de fechar o pool e o cliente SQS. A readiness da API e a dos workers usam a mesma
-  função (`checkReadiness`).
+- **Workers:** sobem o contexto Nest (DI, ORM, cliente SQS) e um servidor HTTP interno
+  (`WORKER_HEALTH_PORT`, 9100) com `/health/live`, `/health/ready` e `/metrics`.
+  - **Readiness:** `/health/ready` responde 503 `starting` até o loop de trabalho ter iniciado.
+  - **SIGTERM durante o start:** o processo espera o start terminar e para o loop que ele produziu,
+    depois fecha o pool e o cliente SQS e sai com 0.
+  - **Mesma checagem na API e nos workers:** `checkReadiness`, com o ping do Postgres passando pelo
+    `DatabaseProbe` (seção 16).
 - **Desligamento (SIGTERM):** o Docker manda SIGTERM e, se o processo não sair dentro do
   `stop_grace_period` (15 s), manda SIGKILL. O handler de SIGTERM é instalado **antes do boot**: os
   entrypoints importam estaticamente só a config e `graceful-shutdown.ts`, e carregam Nest, ORM e SDK
@@ -260,16 +272,26 @@ localstack (healthy = init concluído) ───────┼──► api ×3
 
 1. todos os serviços `healthy`, na quantidade esperada de réplicas, e migrations com exit 0;
 2. 30 requisições pelo nginx atendidas por 3 instâncias distintas (na execução local: 10/10/10);
-3. failover: com uma réplica parada, 20/20 requisições têm sucesso pelas outras duas. A primeira
-   requisição que cai na réplica morta espera o `proxy_connect_timeout` (2 s) e é refeita em outra
-   réplica, sem erro para o cliente; depois o DNS re-resolvido tira a réplica do pool;
-4. a réplica volta a `healthy` e o nginx volta a balancear entre 3;
+3. failover com tráfego em segundo plano. Um prober faz GET e um POST de leitura (reconciliação)
+   sem parar, enquanto uma réplica para e volta:
+   - com a réplica parada, 20/20 requisições têm sucesso pelas outras duas;
+   - a réplica volta a `healthy` e o nginx volta a balancear entre 3;
+   - **nenhuma** requisição, do script ou do prober, pode ter resposta fora de 2xx;
+   - a única espera é a convergência do pool do nginx (DNS), e cada requisição dessa espera também
+     precisa dar 2xx;
+4. a mesma convergência e a mesma exigência de 2xx logo depois do `up`, que pode ter recriado as
+   APIs;
 5. um `sqs-consumer` recebe `docker stop` logo depois de reiniciar (boot em andamento) e precisa sair
    com 0 ou 143 em menos de 5 s (nunca 137);
 6. `docker compose stop` com a stack saudável: os 13 containers saem com exit 0, e cada container da
-   aplicação (API, workers, nginx) para em menos de 8 s contados do início do `stop`. O LocalStack
-   tem `stop_grace_period: 30s`: costuma parar em 2–3 s, mas com a stack inteira no ar já passou dos
-   10 s padrão e levou SIGKILL. Um travamento real dele continua falhando o smoke (137).
+   aplicação (API, workers, nginx) para em menos de 12 s contados do início do `stop`.
+   - **Por que 12 s:** é o maior prazo de desligamento dos processos (`sqs-consumer`:
+     max(drain, long poll) + 4 s), abaixo do `stop_grace_period` (15 s).
+   - **Por que não 8 s, como antes:** o consumer espera de propósito o último long poll (até 5 s,
+     seção 12). Com os 13 containers parando juntos, a latência do LocalStack levou um desligamento
+     correto a 8,02 s e reprovou o smoke. O LocalStack
+     tem `stop_grace_period: 30s`: costuma parar em 2–3 s, mas com a stack inteira no ar já passou dos
+     10 s padrão e levou SIGKILL. Um travamento real dele continua falhando o smoke (137).
 
 **Migrations dentro da imagem** (`scripts/image-migrations-check.sh`, também no CI): roda
 `up → down → up` com as migrations do repositório e uma migration de sonda montada na pasta, na
@@ -1553,3 +1575,198 @@ O teste `auth-api.spec.ts` liga um adaptador falso ("Bearer <providerId>") e pro
 
 Por que não autenticação artesanal: o desafio pede IdP externo, e tabela de usuários com hash de
 senha está fora.
+
+---
+
+## 16. Testes: cobertura da seção 13, cenários ponta a ponta e carga
+
+Execução: `test:unit`, `test:integration` e `test:concurrency`, uma suíte de cada vez. Os testes de
+integração e concorrência usam PostgreSQL e LocalStack reais em containers (stack `wws-test`), nunca
+mocks. Todo teste que mexe em wallet termina com `assertLedgerInvariant`.
+
+### Seção 13 × testes
+
+| Item (seção 13)                                   | Onde                                                                                                                                        |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| Money: escala, arredondamento, entradas inválidas | `test/unit/domain/shared/money.spec.ts`                                                                                                     |
+| Invariantes da Wallet                             | `test/unit/domain/wallet/wallet.spec.ts`, `wallet-ledger-entry.spec.ts`                                                                     |
+| Regras de BET, WIN, LOSS, REFUND, ROLLBACK        | `test/unit/domain/wager/wager-settlement.spec.ts`, `wager-transaction*.spec.ts`, `reference-state.spec.ts`                                  |
+| Conflito de moeda                                 | `wager-settlement.spec.ts`, `wallet.spec.ts` (`CURRENCY_MISMATCH`)                                                                          |
+| Idempotency key com payload divergente            | `test/unit/domain/idempotency/idempotency-check.spec.ts`, `payload-hash.spec.ts`                                                            |
+| Migrations e constraints                          | `test/integration/schema/*.spec.ts`                                                                                                         |
+| Atomicidade wallet + ledger + inbox + outbox      | `test/integration/application/failures-and-inbox.spec.ts` (falha da aplicação e falha real do banco no meio)                                |
+| Inbox e redelivery                                | `failures-and-inbox.spec.ts`, `test/integration/messaging/sqs-consumer.spec.ts`                                                             |
+| Publishers concorrentes sobre a mesma outbox      | `test/integration/workers/outbox-publisher.spec.ts`                                                                                         |
+| Retry e DLQ                                       | `sqs-consumer.spec.ts` (malformada, poison, backoff por visibilidade, redrive), `outbox-publisher.spec.ts`                                  |
+| Recuperação após reinicialização                  | `database-outage.spec.ts`, crashes por processo, e o reinício completo de `e2e/multi-instance.spec.ts`                                      |
+| Mesma aposta 50× em paralelo → um débito          | `test/concurrency/use-cases/wallet-races.spec.ts`                                                                                           |
+| Saldo disputado (100/80/80, seção 8)              | `wallet-races.spec.ts`, `test/integration/schema/ledger-concurrency.spec.ts`                                                                |
+| Wallets distintas em paralelo                     | `wallet-races.spec.ts`                                                                                                                      |
+| ≥ 3 processos/instâncias simultâneos              | `test/concurrency/e2e/multi-instance.spec.ts` (3 APIs + 2 consumers + publisher + worker); também 3 consumers e 3 publishers como processos |
+| Worker morto depois do commit e antes do ack      | `test/concurrency/messaging/sqs-consumer-processes.spec.ts`; e um consumer SIGKILLed com tráfego no e2e                                     |
+| Dois publishers sobre a mesma outbox              | `test/concurrency/workers/worker-processes.spec.ts` (3 publishers; morto antes e depois do envio)                                           |
+| ROLLBACK/REFUND antes da referência               | `test/concurrency/workers/pending-reference-races.spec.ts`, `pending-reference-worker.spec.ts`, e REFUNDs correndo com as BETs no e2e       |
+| Reinício do serviço com consistência final        | `e2e/multi-instance.spec.ts`, cenário de reinício                                                                                           |
+
+### Ponta a ponta com processos separados (`test/concurrency/e2e/multi-instance.spec.ts`)
+
+`test/support/topology.ts` sobe o serviço como processos Bun separados, como containers fariam:
+
+- **Topologia:** 3 APIs, 2 `sqs-consumer`, 1 `outbox-publisher` e 1 `pending-reference-worker`.
+- **Cada processo:** pool, cliente SQS e porta de health próprios. Só o PostgreSQL e as filas
+  isoladas são compartilhados.
+- **Prazos curtos:** lock timeout de 1 s e visibilidade de 10 s. Uma mensagem de um consumer morto
+  volta em segundos.
+- **Memória:** a topologia completa coube na máquina de desenvolvimento (WSL2, 4,8 GiB; no pior
+  momento sobrou ~1,85 GiB livre), então a reduzida não foi necessária.
+
+O `ProviderClient` faz o papel do provedor bem-comportado. Manda round robin para as APIs e, com 503
+ou instância inalcançável, reenvia a mesma requisição (mesma `Idempotency-Key`) para a próxima.
+
+**Carga por wallet.** Quatro wallets quentes de 1000,00 recebem, HTTP e SQS ao mesmo tempo:
+
+| Operação         | Canal                                                                   |
+| ---------------- | ----------------------------------------------------------------------- |
+| 10 BETs de 10,00 | HTTP                                                                    |
+| 10 BETs de 5,00  | SQS                                                                     |
+| 5 WINs de 7,00   | HTTP                                                                    |
+| 3 REFUNDs        | HTTP, correndo com suas BETs de 10,00 enviadas por SQS (qualquer ordem) |
+| 1 BET de 10,00   | às 3 APIs ao mesmo tempo e duas vezes pela fila (mesma key)             |
+
+Tudo cabe no saldo, então o saldo final é exato em qualquer intercalação:
+1000 − 100 − 50 + 35 − 30 + 30 − 10 = **875,00**.
+
+**Cenário 1: instâncias simultâneas.**
+
+- A BET disputada recebe o mesmo `transactionId` das 3 APIs.
+- Cada wallet termina com exatamente 39 transações e saldo 875,00.
+- A prova final roda em **todas** as wallets:
+  - `assertLedgerInvariant` e reconciliação pela API com `difference = 0.00`;
+  - nenhum lançamento duplicado e nenhuma transação pendente;
+  - inbox toda processada;
+  - todo evento da outbox chega uma vez à fila `wallet-events`, sem `eventId` repetido e na ordem da
+    `sequence` por wallet.
+
+**Cenário 2: reinício.** A mesma carga, em baixa concorrência para durar.
+
+1. Com 25% decidido, `SIGKILL` em uma API e em um consumer.
+2. Com 50%, `SIGTERM` em todos os processos. Todos precisam sair com 0.
+3. Todos sobem de novo.
+
+O teste exige que:
+
+- os cortes caiam com a carga em andamento;
+- algum cliente tenha precisado reenviar;
+- a prova final de consistência valha em todas as wallets, inclusive as do cenário 1.
+
+O resultado é o mesmo saldo exato, sem perda e sem efeito duplo.
+
+### Teste instável do entrypoint `sqs-consumer` (A3b): causa e correção
+
+- **Sintoma:** o A3b falhou uma vez sob carga, em ~12,5 s.
+- **Reprodução:** a sequência do teste (`live` → `ready` → `/metrics` → SIGTERM) com 4 núcleos
+  ocupados. 9 de 15 execuções saíram com 1 e "shutdown deadline exceeded".
+- **O que travava:** o `orm.close()`, para sempre.
+- **Causa** (kysely 0.29.6, usado pelo MikroORM 7): fechar o pool enquanto uma conexão ainda está
+  sendo aberta trava.
+  1. O `destroy()` zera o pool interno antes do `pool.end()`.
+  2. A aquisição pendente termina, acessa o pool zerado e lança `TypeError` sem devolver o cliente.
+  3. O `end()` espera esse cliente para sempre.
+
+  O worker abria essa janela de dois jeitos. O `/health/ready` respondia 200 antes de o loop ter
+  iniciado, e um SIGTERM nessa fase fechava o app sob o `start()` em andamento e sob um `select 1`
+  do probe do `DatabaseGate`, que acabava de abrir a primeira conexão.
+
+- **Correção:**
+  - **`DatabaseProbe`** (`src/infrastructure/persistence/database-probe.ts`): todo `select 1`
+    (readiness da API e dos workers, `DatabaseGate`) passa por ele, que registra os probes em voo.
+    No `beforeApplicationShutdown`, que o Nest roda antes do `onApplicationShutdown` onde o MikroORM
+    fecha, ele espera esses probes e passa a recusar novos, e a readiness responde 503.
+  - **`run-worker.ts`:** readiness `starting` (503) até o loop iniciar, e o SIGTERM espera o start
+    em andamento e para o loop que ele produziu.
+- **Prova:**
+  - `test/integration/schema/database-probe.spec.ts` reproduz o travamento de forma determinística.
+    Sem a espera, o close fica "hung"; com ela, fecha.
+  - O A3d manda SIGTERM no instante em que o `live` responde.
+  - O reprodutor rodou 30 vezes sob a mesma carga: 30/30 com exit 0.
+
+### 502 do nginx ao trocar réplicas: causa e correção
+
+- **Evidência:** o log JSON do nginx mostrou `"upstreamStatus":"502, 502, 200"`. Antes de acertar,
+  o nginx tentou IPs mortos: réplica parada, ou recriada com outro IP, ainda no DNS.
+- **Causa:**
+  - Com `proxy_next_upstream_tries 3`, uma lista com mais entradas mortas do que tentativas devolvia
+    502 ao cliente. O smoke só passava porque o `wait_until` refazia a requisição.
+  - Depois de um `up --build`, que recriou as APIs, o pool chegou a ficar com um só IP por alguns
+    segundos (`valid=5s` e uma falha de DNS), o que reprovou o balanceamento.
+  - Havia ainda um risco que o smoke não exercitava: no desligamento, a réplica fecha sockets
+    keepalive que o nginx pode reusar no mesmo instante. Para GET o nginx tenta de novo; um POST já
+    enviado vira 502.
+- **Correção:**
+  - **Pool:** `valid=1s`, `max_fails=1 fail_timeout=3s` e `proxy_connect_timeout 1s`.
+  - **Novas tentativas:** `proxy_next_upstream_tries 0` com `proxy_next_upstream_timeout 5s`, ou
+    seja, todas as réplicas dentro do prazo.
+  - **Keepalive e drain:** `keepalive_timeout 2s` no upstream, e o drain de 2,5 s da API
+    (`HTTP_SHUTDOWN_DRAIN_MS`, `src/infrastructure/http/http-drain.ts`) com `Connection: close` e
+    readiness 503.
+  - **Smoke estrito** (seção 6): nenhuma requisição pode ter resposta fora de 2xx, inclusive um
+    prober em segundo plano com POST de leitura.
+- **Resultado:** 3 smokes seguidos sem nenhuma resposta não-2xx, com mais de mil POSTs pelo nginx
+  durante failover e reintegração.
+
+### Teste de carga (`bun run test:load`)
+
+**Como rodar:** com a stack de dev no ar (`docker compose up -d --build --wait`), e
+`docker compose down` logo depois. Rodou sem a stack de testes.
+
+**Ambiente:**
+
+- Intel i5-9300HF (8 threads) e 4,8 GiB no WSL2, Docker 29.9, Bun 1.3.14.
+- O cliente roda na mesma máquina da stack: os números incluem a disputa de CPU entre o gerador de
+  carga, as 3 APIs, os workers, o PostgreSQL e o LocalStack.
+
+**Metodologia** (`scripts/load-test.ts`):
+
+- 32 clientes concorrentes contra o nginx, com 5 s de aquecimento (fora da medição) e janela de 30 s
+  por perfil.
+- **Perfis:**
+  - **spread:** 500 wallets;
+  - **hot:** 70% do tráfego em 5 wallets e 30% em 100 outras.
+- **Mistura:** BET 60%, WIN 20%, LOSS 10%, REFUND de uma BET processada 8%, mais 2% de reenvios com
+  a mesma key.
+- **Latência:** medida no cliente, da requisição inteira pelo nginx.
+- **Métricas das réplicas:** lock conflicts, retries e espera de lock vêm do `/metrics` de cada
+  réplica (diferença na janela, somada nas 3). O total de decisões contadas pelas réplicas confere
+  com as requisições menos os replays, o que prova que o scrape funcionou.
+- **Outbox lag:** amostrado a cada 1 s no PostgreSQL.
+- **No fim:** saldo = ledger em todas as wallets (SQL) e reconciliação pela API numa amostra.
+
+Resultado da segunda execução (a primeira deu spread 103 req/s, p99 1376 ms; hot 54 req/s, p99
+2508 ms):
+
+| Perfil                 | Throughput  | p50    | p95     | p99     | Erros                       | Lock conflicts / retries | Espera média de lock | Outbox lag (máx.)      |
+| ---------------------- | ----------- | ------ | ------- | ------- | --------------------------- | ------------------------ | -------------------- | ---------------------- |
+| spread (500 wallets)   | 124,7 req/s | 235 ms | 491 ms  | 902 ms  | 0% (3742 × 200, 99 replays) | 0 / 0                    | 25 ms                | 1,45 s (151 pendentes) |
+| hot (70% em 5 wallets) | 87,9 req/s  | 222 ms | 1195 ms | 1714 ms | 0% (2637 × 200, 61 replays) | 0 / 0                    | 239 ms               | 2,76 s (199 pendentes) |
+
+Consistência depois das duas janelas: 0 wallets com saldo ≠ ledger, e 25/25 reconciliações
+consistentes.
+
+**Análise:**
+
+- **Hot wallet:** o lock por wallet serializa o tráfego de uma wallet, como desenhado. A espera
+  média de lock sobe ~10×, o p95 dobra e o throughput cai ~30%. O p50 quase não muda, porque 30% do
+  tráfego vai para wallets frias.
+- **Zero lock conflicts:** a espera nunca chegou ao `lock_timeout` de 5 s da stack de dev. Com mais
+  pressão sobre a mesma wallet, ou com um `lock_timeout` menor, os 503 transitórios apareceriam
+  (o caminho é coberto pelos testes de integração). Não foi forçado aqui.
+- **Outbox lag:** fica em poucos segundos. A outbox esvazia em milissegundos depois da janela, e o
+  publisher acompanha a taxa de escrita.
+- **Variação:** 103 contra 125 req/s entre duas execuções iguais. O número absoluto depende da
+  máquina compartilhada e não deve ser lido como capacidade de produção.
+- **Gargalo:** o teste não isolou o gargalo. A CPU é dividida entre todos os processos, e um
+  experimento mais limpo usaria uma máquina separada para gerar carga.
+- **Escopo:** a carga entra só por HTTP. O caminho SQS é exercitado nos testes de concorrência, não
+  medido aqui.
+- **422:** nenhum. Saldo inicial alto e REFUND só de BET processada evitam rejeições de negócio, então
+  todo 200 é uma decisão PROCESSED.
