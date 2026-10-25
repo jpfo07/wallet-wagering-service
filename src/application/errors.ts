@@ -153,3 +153,19 @@ export class StaleWalletVersionError extends ApplicationError<"STALE_WALLET_VERS
     );
   }
 }
+
+/**
+ * The guarded UPDATE of a PENDING_REFERENCE transaction matched no row although we hold its
+ * wallet lock and have just read it: someone changed it without the lock. A bug, never retried.
+ */
+export class StalePendingTransactionError extends ApplicationError<"STALE_PENDING_TRANSACTION"> {
+  constructor(
+    readonly transactionId: string,
+    readonly expectedReferenceAttempts: number,
+  ) {
+    super(
+      "STALE_PENDING_TRANSACTION",
+      `transaction ${transactionId} is no longer PENDING_REFERENCE with ${expectedReferenceAttempts} attempts while its wallet lock is held`,
+    );
+  }
+}

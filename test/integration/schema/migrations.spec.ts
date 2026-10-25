@@ -50,6 +50,7 @@ describe("migrations", () => {
 
     const reverted = await orm.migrator.down({ to: 0 });
     expect(reverted.map((m) => m.name)).toEqual([
+      "Migration20261025000100_workers_schema",
       "Migration20261024000200_messaging_schema",
       "Migration20261024000100_financial_schema",
     ]);
@@ -59,6 +60,7 @@ describe("migrations", () => {
     expect(applied.map((m) => m.name)).toEqual([
       "Migration20261024000100_financial_schema",
       "Migration20261024000200_messaging_schema",
+      "Migration20261025000100_workers_schema",
     ]);
     const objects = await listObjects(sql);
     expect(objects.tables).toEqual(APP_TABLES);

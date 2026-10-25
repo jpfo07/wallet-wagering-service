@@ -13,16 +13,44 @@ export interface WorkLoop {
 
 export type StartWorkLoop = (app: INestApplicationContext, config: AppConfig) => Promise<WorkLoop>;
 
-/** Room, beyond the consumer drain and its last long poll, for closing health, ORM and SQS. */
+/** Room, beyond the work in progress, for closing health, ORM and SQS. */
 const CLOSE_MARGIN_MS = 4_000;
+const MIN_SHUTDOWN_MS = 10_000;
+
+/**
+ * How long SIGTERM may take, from what each loop can still be doing when it is stopped:
+ * - consumer: its drain, or the long poll in progress (whichever is longer);
+ * - outbox publisher: the SQS call in progress (the batch sends no new layer once stopped);
+ * - pending-reference worker: the candidate in progress, which may wait for the wallet lock on
+ *   every transient attempt.
+ * Killing any of them earlier is still safe (nothing is lost); this only makes the exit clean.
+ */
+export function shutdownTimeoutMs(name: WorkerName, config: AppConfig): number {
+  const work = ((): number => {
+    switch (name) {
+      case "sqs-consumer":
+        return Math.max(
+          config.sqsConsumer.shutdownDrainMs,
+          config.sqsConsumer.waitTimeSeconds * 1000,
+        );
+      case "outbox-publisher":
+        return config.outboxPublisher.sqsRequestTimeoutMs;
+      case "pending-reference-worker":
+        return (
+          config.transientRetry.maxAttempts *
+          (config.database.lockTimeoutMs + config.transientRetry.maxMs)
+        );
+    }
+  })();
+  return Math.max(MIN_SHUTDOWN_MS, work + CLOSE_MARGIN_MS);
+}
 
 /**
  * Common bootstrap of a worker process: Nest application context (DI + ORM + SQS client),
- * internal health server and graceful shutdown. The work loop is plugged in by each entrypoint
- * (the outbox publisher and the pending-reference worker still have none); it must be loaded with
- * `await import()` inside `start`, after the signal handler exists.
+ * internal health server and graceful shutdown. The work loop is plugged in by each entrypoint; it
+ * must be loaded with `await import()` inside `start`, after the signal handler exists.
  */
-export async function runWorker(name: WorkerName, start?: StartWorkLoop): Promise<void> {
+export async function runWorker(name: WorkerName, start: StartWorkLoop): Promise<void> {
   const config = loadConfig();
   const log = (message: string): void => {
     console.log(
@@ -32,11 +60,7 @@ export async function runWorker(name: WorkerName, start?: StartWorkLoop): Promis
 
   // Signal handler first, heavy modules after it (see graceful-shutdown.ts).
   const shutdown = installGracefulShutdown({
-    timeoutMs: Math.max(
-      10_000,
-      Math.max(config.sqsConsumer.shutdownDrainMs, config.sqsConsumer.waitTimeSeconds * 1000) +
-        CLOSE_MARGIN_MS,
-    ),
+    timeoutMs: shutdownTimeoutMs(name, config),
     log,
   });
   log("starting");
@@ -82,10 +106,6 @@ export async function runWorker(name: WorkerName, start?: StartWorkLoop): Promis
     await app.close();
   });
 
-  if (start === undefined) {
-    log(`started (health on port ${health.port}); no work loop yet — placeholder until its phase`);
-    return;
-  }
   loop = await start(app, config);
   log(`started (health on port ${health.port})`);
 }

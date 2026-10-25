@@ -1,6 +1,8 @@
 import type {
   DatabaseConfig,
+  OutboxPublisherConfig,
   PendingReferenceConfig,
+  PendingReferenceWorkerConfig,
   SqsConfig,
   SqsConsumerConfig,
   TransientRetryConfig,
@@ -28,6 +30,25 @@ export const TEST_SQS_CONSUMER: SqsConsumerConfig = {
   databasePauseMaxMs: 500,
 };
 
+/** Publisher and worker settings for tests: short polls and pauses. */
+export const TEST_OUTBOX_PUBLISHER: OutboxPublisherConfig = {
+  batchAggregates: 50,
+  maxEventsPerAggregate: 10,
+  pollIntervalMs: 50,
+  retryBaseMs: 1_000,
+  retryMaxMs: 60_000,
+  sqsRequestTimeoutMs: 5_000,
+  errorPauseBaseMs: 50,
+  errorPauseMaxMs: 200,
+};
+
+export const TEST_PENDING_REFERENCE_WORKER: PendingReferenceWorkerConfig = {
+  batchSize: 50,
+  pollIntervalMs: 50,
+  errorPauseBaseMs: 50,
+  errorPauseMaxMs: 200,
+};
+
 /** Connection data of the test stack (docker-compose.test.yml). Never reads DATABASE_* vars. */
 export const testInfra = {
   dbHost: process.env["TEST_DATABASE_HOST"] ?? "localhost",
@@ -53,6 +74,7 @@ export function testDatabaseConfig(
     poolMax: 5,
     lockTimeoutMs: 5000,
     statementTimeoutMs: 15000,
+    idleInTransactionTimeoutMs: 30000,
     ...overrides,
   };
 }

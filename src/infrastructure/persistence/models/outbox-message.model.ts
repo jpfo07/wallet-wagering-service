@@ -13,6 +13,9 @@ export const OutboxMessageRecord = defineEntity({
     attempts: p.integer(),
     nextAttemptAt: p.datetime(3).nullable(),
     publishedAt: p.datetime(3).nullable(),
+    // GENERATED ALWAYS AS IDENTITY: assigned by PostgreSQL at insert, never written by the app.
+    // Publication order per aggregate; not part of the domain object.
+    sequence: p.bigint("string").autoincrement(),
   },
 });
 

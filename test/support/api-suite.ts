@@ -16,6 +16,8 @@ import type { IsolatedDatabase } from "./database.ts";
 import {
   TEST_PENDING_REFERENCE,
   TEST_SQS_CONSUMER,
+  TEST_OUTBOX_PUBLISHER,
+  TEST_PENDING_REFERENCE_WORKER,
   TEST_TRANSIENT_RETRY,
   testSqsConfig,
 } from "./test-env.ts";
@@ -68,6 +70,8 @@ export function useApiSuite(name: string): () => ApiSuite {
       transientRetry: TEST_TRANSIENT_RETRY,
       pendingReference: TEST_PENDING_REFERENCE,
       sqsConsumer: TEST_SQS_CONSUMER,
+      outboxPublisher: TEST_OUTBOX_PUBLISHER,
+      pendingReferenceWorker: TEST_PENDING_REFERENCE_WORKER,
     };
     const moduleRef = await Test.createTestingModule({ imports: [ApiModule] })
       .overrideProvider(APP_CONFIG)

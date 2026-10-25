@@ -317,6 +317,15 @@ export class WagerTransaction {
     return this.payloadHash === payloadHash;
   }
 
+  /** PENDING_REFERENCE and its next check is due (re-read under the wallet lock by the worker). */
+  isReferenceCheckDue(now: Date): boolean {
+    return (
+      this._status === WagerTransactionStatus.PendingReference &&
+      this._nextReferenceCheckAt !== undefined &&
+      now.getTime() >= this._nextReferenceCheckAt.getTime()
+    );
+  }
+
   isReferenceExpired(now: Date): boolean {
     return (
       this._status === WagerTransactionStatus.PendingReference &&

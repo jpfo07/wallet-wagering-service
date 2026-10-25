@@ -26,6 +26,15 @@ x-app-env: &app-env
   SQS_EVENTS_QUEUE_NAME: wallet-events.fifo
   SQS_CONSUMER_CONCURRENCY: "4"
   SQS_SHUTDOWN_DRAIN_MS: "8000"
+  DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS: "30000"
+  OUTBOX_BATCH_AGGREGATES: "50"
+  OUTBOX_MAX_EVENTS_PER_AGGREGATE: "10"
+  OUTBOX_POLL_INTERVAL_MS: "200"
+  OUTBOX_RETRY_BACKOFF_BASE_MS: "1000"
+  OUTBOX_RETRY_BACKOFF_MAX_MS: "60000"
+  OUTBOX_SQS_REQUEST_TIMEOUT_MS: "5000"
+  PENDING_REFERENCE_BATCH_SIZE: "50"
+  PENDING_REFERENCE_POLL_INTERVAL_MS: "500"
   HTTP_PORT: "3000"
   WORKER_HEALTH_PORT: "9100"
 
@@ -155,6 +164,8 @@ services:
   pending-reference-worker:
     <<: *app
     command: ["bun", "run", "src/entrypoints/pending-reference-worker.ts"]
+    # No SIGTERM espera o candidato em andamento: até 3 × (lock_timeout + backoff) + 4 s ≈ 20 s.
+    stop_grace_period: 25s
     deploy:
       replicas: 2
     healthcheck: *worker-healthcheck

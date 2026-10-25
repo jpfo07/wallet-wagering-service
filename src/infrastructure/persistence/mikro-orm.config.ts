@@ -13,7 +13,9 @@ export const MIGRATIONS_PATH = fileURLToPath(new URL("./migrations", import.meta
  *
  * lock_timeout / statement_timeout are passed as startup options of every pooled
  * connection, so a blocked `SELECT ... FOR UPDATE` fails fast with SQLSTATE 55P03
- * instead of hanging the request.
+ * instead of hanging the request. idle_in_transaction_session_timeout makes PostgreSQL end a
+ * session that holds a transaction open without running statements (a hung process), so its locks
+ * do not outlive it.
  */
 export function buildOrmOptions(db: DatabaseConfig, overrides: Partial<Options> = {}): Options {
   return defineConfig({
@@ -24,7 +26,9 @@ export function buildOrmOptions(db: DatabaseConfig, overrides: Partial<Options> 
     password: db.password,
     pool: { min: 0, max: db.poolMax },
     driverOptions: {
-      options: `-c lock_timeout=${db.lockTimeoutMs} -c statement_timeout=${db.statementTimeoutMs}`,
+      options:
+        `-c lock_timeout=${db.lockTimeoutMs} -c statement_timeout=${db.statementTimeoutMs}` +
+        ` -c idle_in_transaction_session_timeout=${db.idleInTransactionTimeoutMs}`,
     },
     entities: [...PERSISTENCE_MODELS],
     extensions: [Migrator],

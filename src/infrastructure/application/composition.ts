@@ -8,12 +8,20 @@ import {
   GetTransactionByExternalId,
   GetWallet,
 } from "../../application/queries/queries.ts";
+import { PublishOutboxBatch } from "../../application/outbox/publish-outbox-batch.ts";
+import type { EventPublisher } from "../../application/ports/event-publisher.ts";
 import { TransactionRunner } from "../../application/transaction-runner.ts";
 import { ProcessWagerTransaction } from "../../application/wager/process-wager-transaction.ts";
+import type { PendingReferencePolicy } from "../../application/wager/process-wager-transaction.ts";
+import { RecheckPendingReferences } from "../../application/wager/recheck-pending-reference.ts";
 import { CreateWallet } from "../../application/wallet/create-wallet.ts";
 import { ReconcileWallet } from "../../application/wallet/reconcile-wallet.ts";
 import { ExponentialBackoff } from "../../domain/shared/backoff-policy.ts";
-import type { PendingReferenceConfig, TransientRetryConfig } from "../config/env.ts";
+import type {
+  OutboxPublisherConfig,
+  PendingReferenceConfig,
+  TransientRetryConfig,
+} from "../config/env.ts";
 import { InMemoryApplicationMetrics, JsonLineLogger } from "../observability/telemetry-adapters.ts";
 import { MikroOrmUnitOfWork } from "../persistence/mikro-orm-unit-of-work.ts";
 import {
@@ -48,7 +56,10 @@ export interface Application {
   readonly getLedgerPage: GetLedgerPage;
   readonly getTransaction: GetTransaction;
   readonly getTransactionByExternalId: GetTransactionByExternalId;
+  readonly recheckPendingReferences: RecheckPendingReferences;
   readonly dependencies: ApplicationDependencies;
+  /** Shared by the use cases; the outbox publisher is composed on it (buildPublishOutboxBatch). */
+  readonly runner: TransactionRunner;
 }
 
 /** Composition root of the application layer, shared by the Nest module and the tests. */
@@ -80,19 +91,20 @@ export function buildApplication(
     deps.metrics,
     deps.logger,
   );
+  const pendingReference: PendingReferencePolicy = {
+    backoff: ExponentialBackoff.of({
+      baseMs: config.pendingReference.baseMs,
+      maxMs: config.pendingReference.maxMs,
+    }),
+    ttlMs: config.pendingReference.ttlMs,
+  };
   return {
     processWagerTransaction: new ProcessWagerTransaction(
       runner,
       deps.clock,
       deps.ids,
       deps.random,
-      {
-        backoff: ExponentialBackoff.of({
-          baseMs: config.pendingReference.baseMs,
-          maxMs: config.pendingReference.maxMs,
-        }),
-        ttlMs: config.pendingReference.ttlMs,
-      },
+      pendingReference,
       deps.metrics,
       deps.logger,
     ),
@@ -102,6 +114,38 @@ export function buildApplication(
     getLedgerPage: new GetLedgerPage(runner),
     getTransaction: new GetTransaction(runner),
     getTransactionByExternalId: new GetTransactionByExternalId(runner),
+    recheckPendingReferences: new RecheckPendingReferences(
+      runner,
+      deps.clock,
+      deps.ids,
+      deps.random,
+      pendingReference,
+      deps.metrics,
+      deps.logger,
+    ),
     dependencies: deps,
+    runner,
   };
+}
+
+/** The outbox publisher on the application's runner, clock and telemetry. */
+export function buildPublishOutboxBatch(
+  application: Application,
+  publisher: EventPublisher,
+  config: OutboxPublisherConfig,
+): PublishOutboxBatch {
+  const { clock, random, metrics, logger } = application.dependencies;
+  return new PublishOutboxBatch(
+    application.runner,
+    publisher,
+    clock,
+    random,
+    {
+      aggregates: config.batchAggregates,
+      eventsPerAggregate: config.maxEventsPerAggregate,
+      retryBackoff: ExponentialBackoff.of({ baseMs: config.retryBaseMs, maxMs: config.retryMaxMs }),
+    },
+    metrics,
+    logger,
+  );
 }

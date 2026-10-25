@@ -82,6 +82,26 @@ export async function settleUnderLock(
 }
 
 /**
+ * A transaction that has just been decided (PROCESSED, REJECTED or FAILED) may be the reference
+ * some PENDING_REFERENCE transactions of the same wallet wait for. Their next check is brought
+ * forward to `at`, so the worker resolves them in its next cycle instead of after their backoff.
+ * Runs under the same wallet lock (wallet → transaction rows, the order the worker uses too).
+ */
+export async function expediteWaitingDependents(
+  transactions: WagerTransactionRepository,
+  decided: WagerTransaction,
+  at: Date,
+): Promise<number> {
+  if (!decided.isTerminal()) return 0;
+  return transactions.expediteReferenceChecks({
+    walletId: decided.walletId,
+    providerId: decided.providerId,
+    referenceExternalTransactionId: decided.externalTransactionId,
+    at,
+  });
+}
+
+/**
  * The reference by (providerId, referenceExternalTransactionId), its PROCESSED dependents and the
  * PROCESSED ROLLBACKs of those. The computation itself belongs to the domain (ReferenceState).
  */

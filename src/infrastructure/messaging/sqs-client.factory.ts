@@ -10,11 +10,21 @@ import type { SqsConfig } from "../config/env.ts";
  * inside `QueueUrl` (e.g. `localstack:4566` or `*.localstack.cloud`). We pin it off so every
  * request goes to the configured endpoint (or the regional AWS endpoint), regardless of the
  * host the emulator writes into queue URLs.
+ *
+ * `requestTimeoutMs` / `maxAttempts` bound how long one call can take (the outbox publisher holds
+ * row locks while it waits for SQS).
  */
-export function createSqsClient(config: SqsConfig): SQSClient {
+export function createSqsClient(
+  config: SqsConfig,
+  options: { readonly requestTimeoutMs?: number; readonly maxAttempts?: number } = {},
+): SQSClient {
   return new SQSClient({
     region: config.region,
     useQueueUrlAsEndpoint: false,
     ...(config.endpoint === undefined ? {} : { endpoint: config.endpoint }),
+    ...(options.requestTimeoutMs === undefined
+      ? {}
+      : { requestHandler: { requestTimeout: options.requestTimeoutMs } }),
+    ...(options.maxAttempts === undefined ? {} : { maxAttempts: options.maxAttempts }),
   });
 }

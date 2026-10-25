@@ -28,7 +28,7 @@ import type { TransactionRunner } from "../transaction-runner.ts";
 import { optionalText, requireText, requireUuid } from "../validation.ts";
 import { wagerTransactionResult } from "../views.ts";
 import type { WagerTransactionResult } from "../views.ts";
-import { settleUnderLock } from "./settle-under-lock.ts";
+import { expediteWaitingDependents, settleUnderLock } from "./settle-under-lock.ts";
 
 /** The same command for HTTP (body + Idempotency-Key header) and SQS (message `data`). */
 export interface WagerTransactionCommand {
@@ -74,7 +74,8 @@ interface Attempt {
  * Processes one wager transaction, entirely inside one SQL transaction:
  *
  *   lock wallet → inbox (SQS) → idempotency → create → reference state → settle → insert
- *   transaction → ledger + versioned wallet update → outbox → inbox processed → COMMIT
+ *   transaction → ledger + versioned wallet update → outbox → bring forward the PENDING_REFERENCE
+ *   transactions waiting for this one → inbox processed → COMMIT
  *
  * The wallet lock comes first: in READ COMMITTED every later SELECT sees what the previous holder
  * of the same lock committed, so the idempotency check and the reference state can't be stale.
@@ -253,6 +254,7 @@ export class ProcessWagerTransaction {
       await scope.wallets.save(wallet, versionRead);
     }
     await scope.outbox.enqueue(events.map((event) => OutboxMessage.enqueue(event)));
+    await expediteWaitingDependents(scope.transactions, transaction, at);
     await this.markInbox(scope, inboxToMark, at);
     return { result: wagerTransactionResult(transaction, false), walletId: wallet.id };
   }

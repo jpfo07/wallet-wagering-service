@@ -606,6 +606,10 @@ Convenções:
 Índices de leitura: `wager_transactions_reference_idx` (dependentes de uma referência e seus
 ROLLBACKs, para o `ReferenceState`), `wager_transactions_pending_due_idx` (fila do worker de
 PENDING_REFERENCE) e `UNIQUE (wallet_id, wallet_version)`, que é o cursor do `GET /ledger`.
+A Fase 6 acrescentou (migration `workers_schema`) `outbox_messages.sequence` (identity, único), o
+índice `outbox_messages_pending_aggregate_idx (aggregate_id, sequence) WHERE published_at IS NULL` e
+`wager_transactions_pending_by_reference_idx (provider_id, reference_external_transaction_id) WHERE
+status = 'PENDING_REFERENCE'` (seção 13).
 
 ### Saldo × ledger garantido pelo banco (T4–T7)
 
@@ -715,8 +719,8 @@ cenários com movimento terminam com `assertLedgerInvariant`.
   aplicação, com `REVOKE UPDATE, DELETE, TRUNCATE` no ledger e nas transações.
 - **Custo no hot wallet:** T4 e T6 fazem uma ou duas buscas por índice por transação, desprezível
   perto da espera pelo lock (a medir no teste de carga).
-- **Ordem dos eventos entre publishers (Fase 6):** com `SKIP LOCKED`, dois publishers podem publicar
-  eventos da mesma wallet fora de ordem no `wallet-events.fifo`. Fica para o desenho do publisher.
+- **Ordem dos eventos entre publishers:** resolvida na Fase 6 com `outbox_messages.sequence` e "só a
+  cabeça de cada wallet é elegível" (seção 13).
 - **Retenção:** inbox e outbox publicadas crescem sem limpeza.
 
 ## 10. Use cases, transação e concorrência
@@ -740,8 +744,8 @@ composição usada pelos testes) e o `ApplicationModule` só expõe essas instâ
 Os repositórios usam só operações nativas (`findOne` com `disableIdentityMap`, `insert`,
 `nativeUpdate`, `INSERT … ON CONFLICT DO NOTHING`). O flush automático do Unit of Work não é usado: a
 ordem dos SQLs é explícita, nada fica em cache entre comandos e uma violação de unicidade aparece no
-comando que a causou. Publicar, nesta fase, é **gravar na outbox** dentro da transação; o envio ao SQS
-é da Fase 6.
+comando que a causou. Publicar, para o use case, é **gravar na outbox** dentro da transação; o envio
+ao SQS é do publicador da outbox (seção 13).
 
 ### `ProcessWagerTransaction`: a ordem dentro da transação
 
@@ -758,10 +762,12 @@ toda tentativa**. Depois, numa única transação SQL:
 6. `settleWager`.
 7. INSERT da transação; se houve lançamento, INSERT do ledger + UPDATE versionado da wallet.
 8. Outbox: Processed (+ BalanceChanged se o saldo mudou), Rejected ou PendingReference.
-9. Inbox marcada como processada → COMMIT (as FKs e os triggers T5–T7 conferem tudo aqui).
+9. Se a transação ficou terminal: adianta as PENDING_REFERENCE da mesma wallet que esperam por ela
+   (Fase 6, seção 13).
+10. Inbox marcada como processada → COMMIT (as FKs e os triggers T5–T7 conferem tudo aqui).
 
-Os passos 5, 6 e a montagem dos eventos ficam em `settle-under-lock.ts`, que o worker de
-PENDING_REFERENCE (Fase 6) vai reaproveitar.
+Os passos 5, 6 e a montagem dos eventos ficam em `settle-under-lock.ts`, reaproveitado pelo worker de
+PENDING_REFERENCE (seção 13).
 
 **Por que é seguro com várias instâncias:**
 
@@ -1137,3 +1143,208 @@ Todos terminam com `assertLedgerInvariant`.
   preço de um desligamento rápido sem abortar o poll.
 - Mensagens que o SQS entregar numa receive cuja conexão caiu (rede, não SIGTERM) só voltam depois do
   VisibilityTimeout. É atraso, não perda.
+
+## 13. Workers: publicador da outbox e PENDING_REFERENCE
+
+Os dois processos são adaptadores finos sobre use cases da camada de aplicação: `PublishOutboxBatch`
+(`src/application/outbox/`) e `RecheckPendingReferences` (`src/application/wager/`). Os loops ficam
+em `src/infrastructure/workers/` (`PollingLoop`: ciclo produtivo roda de novo na hora, ocioso espera
+o intervalo de poll, falha espera com backoff exponencial e nunca desiste). No compose rodam 2
+réplicas de cada.
+
+### Publicador: ordem por wallet com vários publishers
+
+Dois problemas com o `SELECT … FOR UPDATE SKIP LOCKED` puro:
+
+1. **Ordem entre publishers.** O publisher A trava E1 da wallet W; o B pula E1, pega E2 e publica
+   antes. No `wallet-events.fifo` o consumidor receberia E2 antes de E1.
+2. **`occurred_at` não ordena.** Duas transações da mesma wallet em instâncias diferentes são
+   serializadas pelo lock, mas os relógios divergem alguns ms: a segunda pode gravar um
+   `occurred_at` menor. É o mesmo motivo de o ledger usar `wallet_version` (seção 9).
+
+Solução:
+
+- **`sequence bigint GENERATED ALWAYS AS IDENTITY`** na outbox. O `nextval()` não é lock. Como toda
+  transação que grava eventos de uma wallet segura o lock dela (use case, `CreateWallet`, worker de
+  pendentes), a ordem de `sequence` dentro de uma wallet é a ordem de commit, com qualquer relógio.
+- **Só a cabeça de cada wallet é elegível.** A cabeça é o evento pendente de menor `sequence` da
+  wallet:
+  ```sql
+  SELECT o.aggregate_id FROM outbox_messages o
+   WHERE o.published_at IS NULL AND o.next_attempt_at <= $now
+     AND NOT EXISTS (SELECT 1 FROM outbox_messages p
+                      WHERE p.aggregate_id = o.aggregate_id AND p.published_at IS NULL
+                        AND p.sequence < o.sequence)
+   ORDER BY o.sequence LIMIT $aggregates
+   FOR UPDATE OF o SKIP LOCKED
+  ```
+  Quem trava a cabeça é **dono da wallet** até o commit. O B pula E1 (travado) e não enxerga E2 como
+  cabeça, porque E1 continua pendente. Se A commitar no meio, a rechecagem do `FOR UPDATE` no
+  PostgreSQL (EvalPlanQual) descarta E1, já publicado. Uma cabeça em backoff (`next_attempt_at` no
+  futuro) **segura** o resto da wallet. É o head-of-line do FIFO, de propósito; as outras wallets
+  seguem.
+- **Lote por dono:** para as wallets cuja cabeça travou, um `LATERAL … ORDER BY sequence LIMIT
+$perAggregate FOR UPDATE` pega os próximos eventos (até `OUTBOX_MAX_EVENTS_PER_AGGREGATE`). É
+  `FOR UPDATE` sem SKIP: ninguém mais chega nessas linhas, porque só quem tem a cabeça chega. Evita
+  uma rodada por evento numa hot wallet.
+- **Envio em camadas.** Cada `SendMessageBatch` leva **no máximo um evento por wallet** (a camada k
+  leva o k-ésimo de cada wallet ainda em jogo, ≤ 10 por chamada). Quando um evento falha, os
+  seguintes da mesma wallet não são enviados neste lote. Uma falha parcial nunca põe E3 na fila antes
+  de E2.
+- `MessageGroupId = aggregateId` (walletId), `MessageDeduplicationId = eventId`, corpo = envelope
+  `toJSON` gravado na outbox, atributos `eventType` e `correlationId`.
+- Na mesma transação: aceitos → `markPublished`; o primeiro que falhou → `scheduleRetry`; o resto
+  fica intocado → COMMIT. A gravação é feita **camada a camada**.
+
+### Transação aberta durante o envio
+
+O lote segura os locks das linhas da outbox enquanto fala com o SQS. Isso não bloqueia o caminho
+financeiro, porque os use cases só **inserem** na outbox. Para que um publisher travado (vivo, mas
+pendurado) não segure os locks para sempre:
+
+- **Cliente SQS próprio do publisher**, com `requestTimeout` (`OUTBOX_SQS_REQUEST_TIMEOUT_MS`, 5 s) e
+  uma tentativa no SDK (o backoff da outbox já repete).
+- **`idle_in_transaction_session_timeout`** (`DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS`, 30 s) em todas
+  as conexões: o PostgreSQL encerra uma sessão parada com transação aberta e solta os locks. Como a
+  gravação é camada a camada, o tempo ocioso dentro da transação é no máximo uma chamada ao SQS. O
+  boot recusa `OUTBOX_SQS_REQUEST_TIMEOUT_MS ≥ DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS`.
+
+### Falhas de processo
+
+| Momento da morte                                          | O que acontece                                                                                                                                                                                                                                                         |
+| --------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Depois do commit do use case, antes de publicar           | As linhas estão pendentes e ninguém as trava. Qualquer réplica pega no próximo poll.                                                                                                                                                                                   |
+| Com o lote aberto, antes do SQS receber                   | A conexão cai, o PostgreSQL faz rollback e solta os locks. Nada mudou; outra réplica publica.                                                                                                                                                                          |
+| Depois do SQS aceitar, antes do COMMIT do `markPublished` | O evento continua pendente **e continua cabeça**, então a próxima réplica republica **na ordem**. Dentro de 5 min o SQS descarta a cópia pelo `MessageDeduplicationId = eventId`; depois disso, quem consome deduplica pelo `eventId` (que é a PK da outbox, estável). |
+
+A entrega é **at-least-once com ordem preservada por wallet**: pode repetir, nunca perde e nunca
+inverte. O mesmo vale para um erro transitório do banco depois do envio: o `TransactionRunner` repete
+o lote inteiro e o SQS deduplica.
+
+### Retry sem desistir
+
+`scheduleRetry` usa backoff exponencial com jitter e teto (`OUTBOX_RETRY_BACKOFF_BASE_MS` 1 s →
+`OUTBOX_RETRY_BACKOFF_MAX_MS` 60 s) e **não tem limite de tentativas**: descartar seria perder um
+evento confirmado. Um evento que nunca publica (ex.: o SQS recusa o payload) trava só a própria
+wallet e aparece na métrica de lag, que é o alarme. Erro do lote inteiro (banco ou SQS fora) → o loop
+pausa com backoff (`OUTBOX_ERROR_PAUSE_*`) e tenta de novo.
+
+### Worker de PENDING_REFERENCE: ordem de locks
+
+O use case trava a **wallet** primeiro e só depois lê ou escreve linhas de transação. Se o worker
+travasse a linha da transação pendente (`FOR UPDATE SKIP LOCKED`) e depois a wallet, a ordem seria a
+inversa, com risco de deadlock contra o use case. Por isso:
+
+1. **Candidatos sem lock:** `status = 'PENDING_REFERENCE' AND next_reference_check_at <= now`,
+   ordenados pelo vencimento (`wager_transactions_pending_due_idx`), numa leitura sem `FOR UPDATE`.
+2. **Uma transação SQL por candidato** (com o retry de transitórios do `TransactionRunner`):
+   `lockById(wallet)` como primeiro SQL → relê a transação → se não está mais PENDING_REFERENCE ou
+   ainda não venceu (outra réplica já tratou), **SKIPPED** → senão, `settleUnderLock` (o mesmo fluxo
+   de domínio da primeira vez) → `updatePending` guardado por `WHERE status = 'PENDING_REFERENCE' AND
+reference_attempts = <lido>` → ledger + wallet versionada, se aplicou → outbox. Tudo na mesma
+   transação.
+
+Duas réplicas sobre o mesmo candidato são serializadas pelo lock da wallet: uma aplica, a outra
+encontra o resultado e pula (provado por teste com barreira de lock). Não há `SKIP LOCKED` nem
+"claim" separado, porque a releitura sob o lock já resolve a duplicidade, e o custo da duplicidade é
+uma leitura.
+
+- **Eventos:** reprocessamento que continua esperando não gera evento (`PendingReference` só na
+  primeira vez); resolvida → `Processed` (+ `BalanceChanged`); expirada/rejeitada → `Rejected`.
+  `correlationId` novo por verificação e `causationId = transactionId`, porque a transação não guarda
+  o `correlationId` original (a propagação ponta a ponta é da Fase 7).
+- **Erro permanente** da transação (invariante do domínio, recusa de integridade do banco) → nova
+  transação com o mesmo protocolo de lock, `fail(INTERNAL_PERMANENT_ERROR)` + `WagerTransactionFailed`
+  (decisão 13). Sem isso o candidato voltaria em todo ciclo. Transitório esgotado → fica como está e
+  volta no próximo ciclo.
+
+### Expiração (decisão 14)
+
+Nenhuma regra nova: `settleWager` já decide. No reprocessamento, se `isReferenceExpired(at)`:
+referência inexistente → `REJECTED` com `REFERENCE_NOT_FOUND`; referência existe mas continua
+PENDING/PENDING_REFERENCE → `REFERENCE_NOT_PROCESSED`. As duas geram `WagerTransactionRejected`. Uma
+referência que já terminou REJECTED/FAILED rejeita na hora, sem esperar o TTL. Backoff 1 s → 60 s e
+TTL de 15 min (envs `PENDING_REFERENCE_*`).
+
+### Adiantar quem espera pela referência
+
+Sem isso, um REFUND que chegou antes da BET esperaria o próximo vencimento do backoff (até 60 s)
+mesmo com a BET já processada. Agora, quando uma transação fica **terminal** (no use case ou no próprio
+worker), na mesma transação SQL:
+
+```sql
+UPDATE wager_transactions SET next_reference_check_at = $at
+ WHERE status = 'PENDING_REFERENCE' AND provider_id = $provider
+   AND reference_external_transaction_id = $externalId
+   AND wallet_id = $wallet AND next_reference_check_at > $at
+```
+
+- Índice parcial `wager_transactions_pending_by_reference_idx`; no caminho normal não acha nada.
+- **Só a mesma wallet**, sob o lock dela: as linhas travadas aqui nunca são disputadas por quem
+  segura o lock de outra wallet, então não há ciclo de locks. Um dependente em outra wallet seria
+  recusado por `REFERENCE_MISMATCH` de qualquer jeito; ele só espera o próprio backoff.
+- É só agendamento: nenhuma regra é decidida aqui, e o resultado continua vindo do `settleWager` sob
+  o lock.
+- Em cadeia (ROLLBACK de um REFUND que esperava a BET), cada ciclo resolve um elo: a BET adianta o
+  REFUND; o REFUND resolvido adianta o ROLLBACK.
+
+### SIGTERM
+
+`stop()` aborta o sinal do loop (acorda qualquer pausa), espera o ciclo em andamento e sai com 0.
+O publisher não envia nova camada depois do sinal e commita o que já decidiu. O worker termina o
+candidato em andamento e deixa o resto do lote para outra réplica. O prazo do processo
+(`shutdownTimeoutMs`) é calculado por worker: publisher = uma chamada SQS + 4 s (mínimo 10 s);
+worker = `tentativas × (lock_timeout + backoff)` + 4 s ≈ 20 s, daí o `stop_grace_period` de 25 s no
+compose. Matar antes disso continua seguro (tabela acima).
+
+### Métricas (em memória até a Fase 7)
+
+- `outbox_published`, `outbox_publish_failed{reason}`.
+- **Outbox lag**, amostrado a cada 1 s pelo publisher: `outbox_oldest_pending_age_ms` (agora −
+  `occurred_at` do pendente mais antigo; aqui milissegundos de skew não importam) e `outbox_pending`
+  (quantidade). Um SQL no índice parcial.
+- `pending_reference_checked{outcome}` (PROCESSED, REJECTED, FAILED, PENDING_REFERENCE, SKIPPED).
+
+### Testes
+
+- **Unitários:** camadas do `PublishOutboxBatch` (um evento por wallet por chamada, falha parcial
+  sem passar na frente, cabeça falhada só bloqueia a própria wallet, chunks de 10, abort entre
+  camadas); `PollingLoop`; config, guarda do timeout e prazos de desligamento; `isReferenceCheckDue`.
+- **Integração** (`test/integration/workers/`, PostgreSQL e LocalStack reais, relógio manual):
+  - publicação com group/dedup/atributos e `published_at`;
+  - falha real do SQS (fila inexistente) → backoff, `attempts` 41 continua elegível, depois publica
+    na ordem;
+  - cabeça em backoff segura só a própria wallet;
+  - cabeça travada por "outro publisher" (conexão crua) → a wallet inteira é pulada, as outras saem;
+  - `occurred_at` invertido por skew → a ordem segue `sequence`;
+  - lag; loop rodando; boot recusando timeout incompatível.
+  - REFUND antes da BET com backoff de 10 min → a BET adianta e **o próximo ciclo resolve, com o
+    relógio parado**;
+  - ROLLBACK esperando com backoff crescente e sem evento novo; WIN pendente; cadeia ROLLBACK →
+    REFUND → BET;
+  - TTL → `REFERENCE_NOT_FOUND` e `REFERENCE_NOT_PROCESSED` com `WagerTransactionRejected`;
+  - candidato repetido → SKIPPED; erro permanente injetado → FAILED + `WagerTransactionFailed`.
+- **Concorrência** (`test/concurrency/workers/`):
+  - 2 workers e 2 produtores (pools separados) na mesma wallet: 20 REFUNDs resolvidos uma vez cada,
+    zero deadlock (`40P01`), saldo e versão exatos;
+  - barreira de lock com 2 workers no mesmo candidato → um PROCESSED, um SKIPPED;
+  - 2 loops reais sobre 8 wallets → cada pendente resolvida uma vez;
+  - **3 processos publishers** com lotes pequenos e eventos sendo commitados durante a execução: todos
+    publicados, conjunto de `eventId` igual ao da outbox, sem duplicata, ordem por wallet = `sequence`,
+    e SIGTERM com exit 0;
+  - **processo morto** (entrypoint só de teste, `SIGKILL`) antes do envio e depois do envio sem
+    marcar: outro processo publica; no segundo caso a cópia é descartada pelo SQS e o evento chega uma
+    vez;
+  - worker de pendentes como processo resolvendo REFUND e saindo com 0 no SIGTERM.
+
+Todos terminam com `assertLedgerInvariant`.
+
+### Limitações e próximos passos
+
+- **Head-of-line:** um evento que o SQS recuse para sempre trava a própria wallet no tópico (não as
+  outras). A saída operacional é o alarme de lag e uma intervenção manual; não há desistência
+  automática, por decisão.
+- **Retenção:** outbox publicada e transações resolvidas crescem sem limpeza (como a inbox).
+- **Throughput por wallet** limitado por lote (`OUTBOX_MAX_EVENTS_PER_AGGREGATE` camadas
+  sequenciais); a medir no teste de carga.
+- Métricas em memória por processo até a Fase 7 (Prometheus).

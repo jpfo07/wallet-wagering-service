@@ -13,4 +13,10 @@ export interface ApplicationMetrics {
   idempotentReplay(): void;
   idempotencyConflict(): void;
   reconciliationDivergence(): void;
+  outboxPublished(count: number): void;
+  outboxPublishFailed(reason: string): void;
+  /** Gauge: age of the oldest pending event (0 when none) and how many are pending. */
+  outboxLag(oldestPendingAgeMs: number, pendingCount: number): void;
+  /** Outcome of a PENDING_REFERENCE re-check: PROCESSED, REJECTED, FAILED, PENDING_REFERENCE, SKIPPED. */
+  pendingReferenceChecked(outcome: string): void;
 }

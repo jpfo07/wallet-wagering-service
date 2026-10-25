@@ -76,7 +76,9 @@ describe("failures, retries and inbox (real PostgreSQL)", () => {
                 return entries;
               },
             }),
-            outbox: { enqueue: () => Promise.reject(new InjectedFault("outbox down")) },
+            outbox: override(scope.outbox, {
+              enqueue: () => Promise.reject(new InjectedFault("outbox down")),
+            }),
           })),
         }),
       });

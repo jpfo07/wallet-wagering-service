@@ -145,6 +145,13 @@ describe("WagerTransaction transition details", () => {
     expect(tx.referenceExpiresAt).toEqual(at(60_000));
     expect(tx.isReferenceExpired(at(59_999))).toBe(false);
     expect(tx.isReferenceExpired(at(60_000))).toBe(true);
+    expect(tx.isReferenceCheckDue(at(9_999))).toBe(false);
+    expect(tx.isReferenceCheckDue(at(10_000))).toBe(true);
+  });
+
+  test("isReferenceCheckDue is false outside PENDING_REFERENCE", () => {
+    expect(inStatus(Status.Processed).isReferenceCheckDue(at(10_000_000))).toBe(false);
+    expect(inStatus(Status.Rejected).isReferenceCheckDue(at(10_000_000))).toBe(false);
   });
 
   test("markPendingReference needs a reference to wait for", () => {

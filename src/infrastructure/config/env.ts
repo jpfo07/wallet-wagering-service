@@ -9,6 +9,12 @@ export interface DatabaseConfig {
   readonly poolMax: number;
   readonly lockTimeoutMs: number;
   readonly statementTimeoutMs: number;
+  /**
+   * idle_in_transaction_session_timeout: PostgreSQL ends a session that keeps a transaction open
+   * without running statements for this long, releasing its locks. Bounds the damage of a hung
+   * outbox publisher (it holds row locks while it talks to SQS).
+   */
+  readonly idleInTransactionTimeoutMs: number;
 }
 
 export interface SqsConfig {
@@ -58,6 +64,31 @@ export interface SqsConsumerConfig {
   readonly databasePauseMaxMs: number;
 }
 
+/** Outbox publisher (see ARCHITECTURE.md, section 13). */
+export interface OutboxPublisherConfig {
+  /** Aggregates (wallets) claimed per batch: one locked head event each. */
+  readonly batchAggregates: number;
+  /** Events of one aggregate published per batch, in order. */
+  readonly maxEventsPerAggregate: number;
+  readonly pollIntervalMs: number;
+  /** Backoff of an event whose publication failed. There is no attempt limit. */
+  readonly retryBaseMs: number;
+  readonly retryMaxMs: number;
+  /** Timeout of each SQS request; must stay below idleInTransactionTimeoutMs. */
+  readonly sqsRequestTimeoutMs: number;
+  /** Pause after a failed batch (database down...). */
+  readonly errorPauseBaseMs: number;
+  readonly errorPauseMaxMs: number;
+}
+
+/** Worker that re-checks PENDING_REFERENCE transactions. */
+export interface PendingReferenceWorkerConfig {
+  readonly batchSize: number;
+  readonly pollIntervalMs: number;
+  readonly errorPauseBaseMs: number;
+  readonly errorPauseMaxMs: number;
+}
+
 export interface AppConfig {
   readonly instanceId: string;
   readonly httpPort: number;
@@ -70,6 +101,8 @@ export interface AppConfig {
   readonly transientRetry: TransientRetryConfig;
   readonly pendingReference: PendingReferenceConfig;
   readonly sqsConsumer: SqsConsumerConfig;
+  readonly outboxPublisher: OutboxPublisherConfig;
+  readonly pendingReferenceWorker: PendingReferenceWorkerConfig;
 }
 
 export class ConfigError extends Error {
@@ -125,6 +158,11 @@ export function loadConfig(source: Source = process.env): AppConfig {
       poolMax: int(source, "DATABASE_POOL_MAX", 10),
       lockTimeoutMs: int(source, "DATABASE_LOCK_TIMEOUT_MS", 5000),
       statementTimeoutMs: int(source, "DATABASE_STATEMENT_TIMEOUT_MS", 15000),
+      idleInTransactionTimeoutMs: atLeastOne(
+        source,
+        "DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS",
+        30_000,
+      ),
     },
     sqs: {
       endpoint: endpoint === undefined || endpoint === "" ? undefined : endpoint,
@@ -154,6 +192,22 @@ export function loadConfig(source: Source = process.env): AppConfig {
       databaseProbeFreshnessMs: int(source, "SQS_DATABASE_PROBE_FRESHNESS_MS", 2_000),
       databasePauseBaseMs: atLeastOne(source, "SQS_DATABASE_PAUSE_BASE_MS", 1_000),
       databasePauseMaxMs: atLeastOne(source, "SQS_DATABASE_PAUSE_MAX_MS", 30_000),
+    },
+    outboxPublisher: {
+      batchAggregates: atLeastOne(source, "OUTBOX_BATCH_AGGREGATES", 50),
+      maxEventsPerAggregate: atLeastOne(source, "OUTBOX_MAX_EVENTS_PER_AGGREGATE", 10),
+      pollIntervalMs: atLeastOne(source, "OUTBOX_POLL_INTERVAL_MS", 200),
+      retryBaseMs: atLeastOne(source, "OUTBOX_RETRY_BACKOFF_BASE_MS", 1_000),
+      retryMaxMs: atLeastOne(source, "OUTBOX_RETRY_BACKOFF_MAX_MS", 60_000),
+      sqsRequestTimeoutMs: atLeastOne(source, "OUTBOX_SQS_REQUEST_TIMEOUT_MS", 5_000),
+      errorPauseBaseMs: atLeastOne(source, "OUTBOX_ERROR_PAUSE_BASE_MS", 500),
+      errorPauseMaxMs: atLeastOne(source, "OUTBOX_ERROR_PAUSE_MAX_MS", 30_000),
+    },
+    pendingReferenceWorker: {
+      batchSize: atLeastOne(source, "PENDING_REFERENCE_BATCH_SIZE", 50),
+      pollIntervalMs: atLeastOne(source, "PENDING_REFERENCE_POLL_INTERVAL_MS", 500),
+      errorPauseBaseMs: atLeastOne(source, "PENDING_REFERENCE_ERROR_PAUSE_BASE_MS", 500),
+      errorPauseMaxMs: atLeastOne(source, "PENDING_REFERENCE_ERROR_PAUSE_MAX_MS", 30_000),
     },
   };
 }

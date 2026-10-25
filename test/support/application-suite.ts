@@ -7,7 +7,10 @@ import type {
   Application,
   ApplicationDependencies,
 } from "../../src/infrastructure/application/composition.ts";
-import type { DatabaseConfig } from "../../src/infrastructure/config/env.ts";
+import type {
+  DatabaseConfig,
+  PendingReferenceConfig,
+} from "../../src/infrastructure/config/env.ts";
 import {
   InMemoryApplicationMetrics,
   SilentLogger,
@@ -45,6 +48,7 @@ export interface ApplicationSuite extends AppHandle {
   open(options?: {
     readonly database?: Partial<DatabaseConfig>;
     readonly dependencies?: (orm: MikroORM) => Partial<ApplicationDependencies>;
+    readonly pendingReference?: PendingReferenceConfig;
   }): Promise<AppHandle>;
 }
 
@@ -63,6 +67,7 @@ export function useApplicationSuite(
     db: IsolatedDatabase,
     database: Partial<DatabaseConfig> = {},
     dependencies?: (orm: MikroORM) => Partial<ApplicationDependencies>,
+    pendingReference: PendingReferenceConfig = TEST_PENDING_REFERENCE,
   ): Promise<AppHandle> {
     const orm = await MikroORM.init(
       buildOrmOptions({ ...db.config, poolMax: options.poolMax ?? 10, ...database }),
@@ -75,7 +80,7 @@ export function useApplicationSuite(
       {
         instanceId: "test",
         transientRetry: TEST_TRANSIENT_RETRY,
-        pendingReference: TEST_PENDING_REFERENCE,
+        pendingReference,
       },
       { logger: new SilentLogger(), metrics, sleeper, ...dependencies?.(orm) },
     );
@@ -90,7 +95,13 @@ export function useApplicationSuite(
       ...main,
       db,
       sql,
-      open: (openOptions = {}) => openHandle(db, openOptions.database, openOptions.dependencies),
+      open: (openOptions = {}) =>
+        openHandle(
+          db,
+          openOptions.database,
+          openOptions.dependencies,
+          openOptions.pendingReference,
+        ),
     };
   });
 

@@ -4,6 +4,9 @@ import { waitFor } from "./polling.ts";
 /** Printed by processes/consumer-crash-before-ack.ts once COMMIT is done and the ack is pending. */
 export const CRASH_POINT_MARKER = "CRASH_POINT_BEFORE_ACK";
 
+/** Printed by processes/outbox-publisher-crash.ts at its crash point (OUTBOX_CRASH_MODE). */
+export const OUTBOX_CRASH_MARKER = "CRASH_POINT_OUTBOX";
+
 const ROOT = new URL("../../", import.meta.url).pathname;
 
 export function freePort(): number {

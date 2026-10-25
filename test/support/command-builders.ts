@@ -126,10 +126,10 @@ export async function transactionRows(sql: SQL, walletId: string): Promise<Trans
   );
 }
 
-/** Event types in the outbox for the wallet (aggregateId = walletId), in insertion order. */
+/** Event types in the outbox for the wallet (aggregateId = walletId), in publication order. */
 export async function outboxEventTypes(sql: SQL, walletId: string): Promise<string[]> {
   const rows: { event_type: string }[] = await sql.unsafe(
-    "select event_type from outbox_messages where aggregate_id = $1 order by occurred_at, id",
+    "select event_type from outbox_messages where aggregate_id = $1 order by sequence",
     [walletId],
   );
   return rows.map((row) => row.event_type);

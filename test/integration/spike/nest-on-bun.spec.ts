@@ -11,6 +11,8 @@ import type { IsolatedDatabase } from "../../support/database.ts";
 import {
   TEST_PENDING_REFERENCE,
   TEST_SQS_CONSUMER,
+  TEST_OUTBOX_PUBLISHER,
+  TEST_PENDING_REFERENCE_WORKER,
   TEST_TRANSIENT_RETRY,
   childProcessEnv,
   testSqsConfig,
@@ -55,6 +57,8 @@ describe("spike A — NestJS on Bun", () => {
         transientRetry: TEST_TRANSIENT_RETRY,
         pendingReference: TEST_PENDING_REFERENCE,
         sqsConsumer: TEST_SQS_CONSUMER,
+        outboxPublisher: TEST_OUTBOX_PUBLISHER,
+        pendingReferenceWorker: TEST_PENDING_REFERENCE_WORKER,
       };
       const moduleRef = await Test.createTestingModule({ imports: [ApiModule] })
         .overrideProvider(APP_CONFIG)
