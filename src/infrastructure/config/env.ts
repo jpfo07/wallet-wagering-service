@@ -20,6 +20,21 @@ export interface SqsConfig {
   readonly eventsQueueName: string;
 }
 
+/** Bounded retry of transient database errors (lock timeout, deadlock, lost connection...). */
+export interface TransientRetryConfig {
+  /** Total attempts, including the first. */
+  readonly maxAttempts: number;
+  readonly baseMs: number;
+  readonly maxMs: number;
+}
+
+/** How long a transaction waits for its reference (decision 14): exponential backoff + TTL. */
+export interface PendingReferenceConfig {
+  readonly baseMs: number;
+  readonly maxMs: number;
+  readonly ttlMs: number;
+}
+
 export interface AppConfig {
   readonly instanceId: string;
   readonly httpPort: number;
@@ -27,6 +42,8 @@ export interface AppConfig {
   readonly workerHealthPort: number;
   readonly database: DatabaseConfig;
   readonly sqs: SqsConfig;
+  readonly transientRetry: TransientRetryConfig;
+  readonly pendingReference: PendingReferenceConfig;
 }
 
 export class ConfigError extends Error {
@@ -76,6 +93,16 @@ export function loadConfig(source: Source = process.env): AppConfig {
       wagerQueueName: str(source, "SQS_WAGER_QUEUE_NAME", "wager-transactions.fifo"),
       wagerDlqName: str(source, "SQS_WAGER_DLQ_NAME", "wager-transactions-dlq.fifo"),
       eventsQueueName: str(source, "SQS_EVENTS_QUEUE_NAME", "wallet-events.fifo"),
+    },
+    transientRetry: {
+      maxAttempts: int(source, "DATABASE_TRANSIENT_RETRY_ATTEMPTS", 3),
+      baseMs: int(source, "DATABASE_TRANSIENT_RETRY_BASE_MS", 50),
+      maxMs: int(source, "DATABASE_TRANSIENT_RETRY_MAX_MS", 400),
+    },
+    pendingReference: {
+      baseMs: int(source, "PENDING_REFERENCE_BACKOFF_BASE_MS", 1_000),
+      maxMs: int(source, "PENDING_REFERENCE_BACKOFF_MAX_MS", 60_000),
+      ttlMs: int(source, "PENDING_REFERENCE_TTL_MS", 900_000),
     },
   };
 }

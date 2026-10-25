@@ -1,4 +1,17 @@
-import type { DatabaseConfig, SqsConfig } from "../../src/infrastructure/config/env.ts";
+import type {
+  DatabaseConfig,
+  PendingReferenceConfig,
+  SqsConfig,
+  TransientRetryConfig,
+} from "../../src/infrastructure/config/env.ts";
+
+/** The env.ts defaults, except a shorter retry backoff so retries do not slow tests down. */
+export const TEST_TRANSIENT_RETRY: TransientRetryConfig = { maxAttempts: 3, baseMs: 10, maxMs: 40 };
+export const TEST_PENDING_REFERENCE: PendingReferenceConfig = {
+  baseMs: 1_000,
+  maxMs: 60_000,
+  ttlMs: 900_000,
+};
 
 /** Connection data of the test stack (docker-compose.test.yml). Never reads DATABASE_* vars. */
 export const testInfra = {

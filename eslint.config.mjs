@@ -38,5 +38,20 @@ export default tseslint.config(
       ],
     },
   },
+  {
+    files: ["src/application/**/*.ts"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            { group: ["@nestjs/*"], message: "A aplicação não pode depender do NestJS." },
+            { group: ["@mikro-orm/*"], message: "A aplicação não pode depender do MikroORM." },
+            { group: ["**/infrastructure/**"], message: "A aplicação depende só de portas." },
+          ],
+        },
+      ],
+    },
+  },
   prettier,
 );

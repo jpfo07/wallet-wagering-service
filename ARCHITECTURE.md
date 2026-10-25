@@ -467,7 +467,7 @@ Códigos que não viram transação persistida (`ErrorCode`):
 | Código                                                                                                                                                            | Categoria       | Ação    |
 | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------- | ------- |
 | `INVALID_PAYLOAD`, `INVALID_AMOUNT`, `INVALID_CURRENCY`, `KIND_NOT_ALLOWED`, `PROVIDER_RESERVED`, `REFERENCE_REQUIRED`, `REFERENCE_NOT_ALLOWED`, `SELF_REFERENCE` | INVALID_PAYLOAD | FIX     |
-| `WALLET_NOT_FOUND`                                                                                                                                                | NOT_FOUND       | FIX     |
+| `WALLET_NOT_FOUND`, `TRANSACTION_NOT_FOUND`                                                                                                                       | NOT_FOUND       | FIX     |
 | `IDEMPOTENCY_KEY_REUSED`, `EXTERNAL_TRANSACTION_ID_CONFLICT`                                                                                                      | CONFLICT        | FIX     |
 | `WALLET_ALREADY_EXISTS`                                                                                                                                           | CONFLICT        | GIVE_UP |
 | `TRANSIENT_FAILURE`                                                                                                                                               | TRANSIENT       | RETRY   |
@@ -717,3 +717,160 @@ cenários com movimento terminam com `assertLedgerInvariant`.
 - **Ordem dos eventos entre publishers (Fase 6):** com `SKIP LOCKED`, dois publishers podem publicar
   eventos da mesma wallet fora de ordem no `wallet-events.fifo`. Fica para o desenho do publisher.
 - **Retenção:** inbox e outbox publicadas crescem sem limpeza.
+
+## 10. Use cases, transação e concorrência
+
+`src/application` contém os use cases e as portas. Assim como o domínio, **não importa Nest nem
+MikroORM**, e também não lê relógio nem gera IDs: um teste de arquitetura
+(`test/unit/architecture/application-boundaries.spec.ts`) e uma regra do ESLint garantem isso. Os use
+cases são classes puras; `src/infrastructure/application/composition.ts` monta tudo (é a mesma
+composição usada pelos testes) e o `ApplicationModule` só expõe essas instâncias ao Nest.
+
+### Portas e adaptadores
+
+| Porta                                                         | Adaptador                                                                     |
+| ------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| `Clock`, `IdGenerator`, `RandomSource`, `Sleeper`             | `SystemClock`, `UuidV7IdGenerator`, `MathRandomSource`, `TimerSleeper`        |
+| `UnitOfWork.run(work)`: **uma** transação SQL, READ COMMITTED | `MikroOrmUnitOfWork`: `orm.em.fork()` novo por tentativa + `em.transactional` |
+| `WalletRepository`, `WagerTransactionRepository`              | `MikroOrm*Repository`, presos à transação                                     |
+| `LedgerRepository`, `InboxRepository`, `OutboxRepository`     | idem                                                                          |
+| `Logger`, `ApplicationMetrics`                                | `JsonLineLogger` e contadores em memória (pino/Prometheus na Fase 7)          |
+
+Os repositórios usam só operações nativas (`findOne` com `disableIdentityMap`, `insert`,
+`nativeUpdate`, `INSERT … ON CONFLICT DO NOTHING`). O flush automático do Unit of Work não é usado: a
+ordem dos SQLs é explícita, nada fica em cache entre comandos e uma violação de unicidade aparece no
+comando que a causou. Publicar, nesta fase, é **gravar na outbox** dentro da transação; o envio ao SQS
+é da Fase 6.
+
+### `ProcessWagerTransaction`: a ordem dentro da transação
+
+Antes de abrir a transação, o comando é validado (`Money`, kind, referência por kind, UUIDs, textos de
+1 a 255 caracteres). Também são gerados o `transactionId` e o `ledgerEntryId`, **reaproveitados em
+toda tentativa**. Depois, numa única transação SQL:
+
+1. `SELECT … FROM wallets WHERE id = ? FOR UPDATE`, o **primeiro** SQL. Ausente → `WALLET_NOT_FOUND`.
+2. Se veio do SQS: inbox (`ON CONFLICT DO NOTHING`). Já existe com outro hash → mensagem envenenada.
+3. Idempotência: busca por `(providerId, idempotencyKey)` e por `(providerId, externalTransactionId)`
+   → `checkIdempotency` (replay, conflito ou nova).
+4. `WagerTransaction.create` (PENDING).
+5. Carga do `ReferenceState`: referência, dependentes PROCESSED e ROLLBACKs deles.
+6. `settleWager`.
+7. INSERT da transação; se houve lançamento, INSERT do ledger + UPDATE versionado da wallet.
+8. Outbox: Processed (+ BalanceChanged se o saldo mudou), Rejected ou PendingReference.
+9. Inbox marcada como processada → COMMIT (as FKs e os triggers T5–T7 conferem tudo aqui).
+
+Os passos 5, 6 e a montagem dos eventos ficam em `settle-under-lock.ts`, que o worker de
+PENDING_REFERENCE (Fase 6) vai reaproveitar.
+
+**Por que é seguro com várias instâncias:**
+
+- O lock é uma linha do Postgres, compartilhada por todas as instâncias. Quem toca a mesma wallet
+  entra uma de cada vez; wallets diferentes não esperam umas pelas outras (sem lock global, provado
+  por teste).
+- **Travar primeiro, ler depois.** Em READ COMMITTED cada SELECT vê o que já foi commitado quando ele
+  começa. Quando a transação ganha o lock, a anterior na mesma wallet já commitou (o lock só sai no
+  commit). Então idempotência, referência e dependentes são lidos sem chance de estarem velhos. Se a
+  idempotência fosse checada antes do lock, duas instâncias poderiam ver "não existe" e debitar duas
+  vezes.
+- O que decide o resultado só muda sob o mesmo lock: dependentes PROCESSED de uma referência são sempre
+  da mesma wallet, porque o `sameContext` exige isso. Uma referência de outra wallet é recusada por
+  campos imutáveis.
+- Um único lock de linha por transação (o T4 trava a mesma linha, de forma reentrante): no caminho
+  normal não há deadlock.
+- O banco continua como backstop: UNIQUEs, `CHECK balance >= 0`, T4 e T6.
+
+**Corrida que o lock não cobre:** a mesma chave (ou o mesmo `externalTransactionId`) para **wallets
+diferentes**. Os locks são outros, as duas transações podem ver "não existe" e a segunda leva `23505`
+em `wager_transactions_provider_idempotency_key_uq` / `_provider_external_uq`. Só esse 23505, com
+esses nomes de constraint, vira `ConcurrentInsertConflictError`: a tentativa é refeita **uma vez**,
+enxerga a linha commitada e responde com conflito (ou replay). Um teste provoca essa intercalação de
+forma determinística: a concorrente commita entre a checagem e o INSERT.
+
+### Gravação da wallet
+
+`UPDATE wallets SET balance, version, updated_at WHERE id = ? AND version = <versão lida>`, via
+`nativeUpdate`, conferindo as linhas afetadas. Os lançamentos são inseridos antes, na mesma transação.
+**0 linhas** com o lock na mão é impossível no caminho normal: alguém escreveu sem lock ou o lock se
+perdeu. Isso vira `StaleWalletVersionError`: rollback total, log de erro e **sem retry** (repetir
+esconderia exatamente o defeito que a guarda revela). LOSS e REJECTED não tocam a wallet.
+
+### Classificação de erros
+
+A classificação lê o SQLSTATE (`persistence-error-classifier.ts`), nunca a classe nem a mensagem.
+
+| Erro                                                                                                             | Tratamento                                                                                                                                                                                   |
+| ---------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `55P03`, `40P01`, `40001`, classe `08`, `57P01`, `57P03`, `53300`; erros de rede (`ECONNRESET`…, checados antes) | transitório: `TransactionRunner` repete a transação inteira, até `DATABASE_TRANSIENT_RETRY_ATTEMPTS` (3) tentativas, backoff 50 → 400 ms com jitter; esgotou → `TransientFailureError` (503) |
+| `23505` nas duas constraints de idempotência                                                                     | corrida: reinicia uma vez                                                                                                                                                                    |
+| qualquer outro classe `23` (inclusive os deferidos, no COMMIT) e `InvariantViolationError`                       | **bug**: `PersistenceIntegrityError`, sem retry                                                                                                                                              |
+| `57014` (statement_timeout) e o resto                                                                            | não transitório: como `lock_timeout` < `statement_timeout`, espera por lock já sai como 55P03, e um statement lento tende a repetir a lentidão                                               |
+
+A repetição é segura porque o erro transitório abortou a tentativa anterior. Se a conexão cair **no
+COMMIT** e não der para saber se ele passou, a repetição usa o mesmo `transactionId` e a mesma chave:
+encontra a linha e devolve o replay, sem efeito duplicado.
+
+### `CreateWallet`
+
+Uma transação: `INSERT … ON CONFLICT (player_id, currency) DO NOTHING`, depois a OPENING e o CREDIT.
+Na corrida, a segunda criação **espera** no índice único; se a primeira commitou, 0 linhas →
+`WALLET_ALREADY_EXISTS` (409). Não há checagem prévia ("existe?"), que estaria sujeita a corrida. O
+`walletId` é gerado uma vez, fora do retry: se o COMMIT se perdeu e a repetição encontra a wallet com o
+**nosso** id, foi o nosso commit que passou, e a resposta é sucesso. Com saldo maior que zero, a
+outbox recebe **`WagerTransactionProcessed` (kind OPENING) + `WalletBalanceChanged`**. Sem o
+Processed, um consumidor veria uma mudança de saldo com um `transactionId` que nunca foi anunciado;
+quem não quer a OPENING filtra pelo `kind`. Com saldo zero não há evento.
+
+### `ReconcileWallet` e consultas
+
+- A reconciliação lê saldo, soma de créditos, soma de débitos e quantidade de lançamentos em **um único
+  SQL** (um snapshot só). Dois SELECTs separados poderiam pegar um commit no meio e acusar uma
+  divergência falsa. As somas ficam em `numeric` e voltam como texto → `Money`. Uma divergência é
+  logada (`error`), contabilizada e devolvida com `consistent: false`, e **nunca é corrigida**.
+- `GetLedgerPage`: paginação por chave em `(wallet_id, wallet_version)`, limite de 1 a 200; o cursor da
+  API (Fase 4) codifica `afterVersion`.
+- `GetTransactionByExternalId` é escopado por provedor. Novo código `TRANSACTION_NOT_FOUND` (404).
+
+### Decisões desta fase
+
+- **`WALLET_NOT_FOUND` vence o conflito de idempotência**, porque o lock da wallet vem antes. Uma
+  transação persistida sempre tem wallet (FK), então um replay legítimo nunca cai aqui.
+- **Hash da inbox** = SHA-256 do JSON canônico do `data` inteiro da mensagem (campos de negócio +
+  `idempotencyKey`). Mesmo `messageId` com outra chave também é mensagem envenenada.
+- **Replay de FAILED** não traz `balance` (FAILED não guarda saldo observado).
+- **`correlationId` e `causationId`** (o `messageId` no SQS) entram no comando e vão para os eventos;
+  a propagação ponta a ponta é da Fase 7.
+- **UUIDs só em minúsculas** na entrada: o Postgres devolve minúsculas, e um `playerId` em maiúsculas
+  geraria outro hash e um falso `WALLET_PLAYER_MISMATCH`.
+
+### Testes
+
+- Todos os testes usam PostgreSQL real; os de integração e concorrência terminam com
+  `assertLedgerInvariant`. A exceção proposital é o teste de divergência da reconciliação, que exige que
+  o invariante esteja violado.
+- **Barreira de lock** (`test/support/lock-barrier.ts`): segura o `FOR UPDATE` da wallet numa conexão
+  crua, dispara as N chamadas, espera (polling em `pg_stat_activity`) até as N estarem bloqueadas no
+  lock e só então solta. A disputa é real e determinística, sem `sleep`.
+- **Falhas injetadas** com `TamperingUnitOfWork` (a transação continua real; o teste só intercala ou
+  faz um passo falhar) e com triggers de teste que lançam erros reais do Postgres (`P0001`; `40001`
+  apenas na primeira vez, controlado por uma sequence, que não é transacional).
+
+### Limitações e próximos passos
+
+- Métricas em memória por processo e logger JSON simples até a Fase 7 (pino + `/metrics`).
+- **VisibilityTimeout × pior caso de processamento (para a Fase 5).** A mensagem precisa continuar
+  invisível enquanto é processada; senão outra instância a recebe no meio. Isso não duplica efeito
+  (idempotência), mas gasta tentativas e polui a DLQ. Pior caso com os valores atuais
+  (`DATABASE_TRANSIENT_RETRY_ATTEMPTS` = 3, `DATABASE_LOCK_TIMEOUT_MS` = 5000, backoff ≤ 50 + 100 ms):
+  - sem a corrida de idempotência: 3 × 5 s + 0,15 s ≈ **15,2 s**;
+  - com o reinício por 23505: até 2 esperas de lock que falham, mais 1 tentativa que pega o lock e leva
+    o 23505, mais um segundo ciclo de 3 × 5 s ≈ **25,3 s**.
+
+  O `VisibilityTimeout` atual é 30 s: a margem é de ~5 s. A regra para a Fase 5, validada no boot do
+  consumidor, é:
+
+  ```
+  VisibilityTimeout > (2 × tentativas − 1) × lock_timeout + backoff + execução + margem
+  ```
+
+  Recomendação: subir o VisibilityTimeout para 60 s (ou estender a visibilidade durante o
+  processamento).

@@ -8,7 +8,12 @@ import { ApiModule } from "../../../src/infrastructure/http/api.module.ts";
 import { HealthController } from "../../../src/infrastructure/http/health.controller.ts";
 import { createIsolatedDatabase } from "../../support/database.ts";
 import type { IsolatedDatabase } from "../../support/database.ts";
-import { childProcessEnv, testSqsConfig } from "../../support/test-env.ts";
+import {
+  TEST_PENDING_REFERENCE,
+  TEST_TRANSIENT_RETRY,
+  childProcessEnv,
+  testSqsConfig,
+} from "../../support/test-env.ts";
 import { waitFor } from "../../support/polling.ts";
 import { GreetingController, GreetingModule } from "./fixtures/greeting.controller.ts";
 import { ClockService, GreetingService } from "./fixtures/greeting.service.ts";
@@ -45,6 +50,8 @@ describe("spike A — NestJS on Bun", () => {
         workerHealthPort: 0,
         database: db.config,
         sqs: testSqsConfig(),
+        transientRetry: TEST_TRANSIENT_RETRY,
+        pendingReference: TEST_PENDING_REFERENCE,
       };
       const moduleRef = await Test.createTestingModule({ imports: [ApiModule] })
         .overrideProvider(APP_CONFIG)

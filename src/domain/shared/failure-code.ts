@@ -31,6 +31,7 @@ export enum ErrorCode {
   ReferenceNotAllowed = "REFERENCE_NOT_ALLOWED",
   SelfReference = "SELF_REFERENCE",
   WalletNotFound = "WALLET_NOT_FOUND",
+  TransactionNotFound = "TRANSACTION_NOT_FOUND",
   IdempotencyKeyReused = "IDEMPOTENCY_KEY_REUSED",
   ExternalTransactionIdConflict = "EXTERNAL_TRANSACTION_ID_CONFLICT",
   WalletAlreadyExists = "WALLET_ALREADY_EXISTS",
@@ -102,6 +103,10 @@ export const ERROR_CODE_CATALOG: Readonly<Record<ErrorCode, CodeDescriptor>> = O
   [ErrorCode.ReferenceNotAllowed]: invalid,
   [ErrorCode.SelfReference]: invalid,
   [ErrorCode.WalletNotFound]: {
+    category: CodeCategory.NotFound,
+    providerAction: ProviderAction.Fix,
+  },
+  [ErrorCode.TransactionNotFound]: {
     category: CodeCategory.NotFound,
     providerAction: ProviderAction.Fix,
   },
