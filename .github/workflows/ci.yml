@@ -31,6 +31,7 @@ jobs:
       - name: sobe a stack de testes (PostgreSQL + LocalStack)
         run: bun run test:infra:up
       - run: bun run test:integration
+      - run: bun run test:concurrency
       - name: logs da stack de testes
         if: failure()
         run: docker compose -f docker-compose.test.yml logs --tail=100
