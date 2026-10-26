@@ -1,5 +1,7 @@
 # wallet-wagering-service
 
+[![ci](https://github.com/jpfo07/wallet-wagering-service/actions/workflows/ci.yml/badge.svg)](https://github.com/jpfo07/wallet-wagering-service/actions/workflows/ci.yml)
+
 Serviço financeiro distribuído que processa transações de apostas (BET, WIN, LOSS, REFUND, ROLLBACK)
 vindas de vários provedores, por HTTP e por SQS. Mantém o saldo de cada wallet e um ledger
 append-only, com idempotência persistente, e é correto com várias instâncias rodando ao mesmo tempo.
@@ -15,6 +17,15 @@ Stack: Bun 1.3.14, TypeScript estrito, NestJS, MikroORM, PostgreSQL 18, SQS via 
 
 As decisões, os trade-offs, as interpretações de regra e as limitações estão no
 [ARCHITECTURE.md](ARCHITECTURE.md).
+
+## Para avaliação
+
+- Onde cada critério da avaliação e cada falha eliminatória é atendida:
+  [ARCHITECTURE.md § 15](ARCHITECTURE.md#15-avaliação-onde-está-a-evidência).
+- Prova em um comando: `bun run compose:smoke --down`.
+- Testes de integração e de concorrência com PostgreSQL e LocalStack reais, rodando também no CI.
+- Limitações conhecidas:
+  [ARCHITECTURE.md § 16](ARCHITECTURE.md#16-limitações-conhecidas-e-próximos-passos).
 
 ## Pré-requisitos
 
@@ -34,7 +45,7 @@ juntas, mais uma suíte de concorrência, apertam uma máquina com pouca memóri
 ## Setup do zero
 
 ```bash
-git clone <url-do-repositório> wallet-wagering-service
+git clone https://github.com/jpfo07/wallet-wagering-service.git wallet-wagering-service
 cd wallet-wagering-service
 bun install --frozen-lockfile
 ```
